@@ -90,9 +90,10 @@ Current defaults:
 - RVOL threshold: `1.5`
 - Mean reversion z-score: `1.2`
 - Bollinger mean reversion window: `20`
-- Bollinger mean reversion std-dev: `2.0`
-- Bollinger mean reversion stop loss: `1.5%`
+- Bollinger mean reversion std-dev: `1.7`
+- Bollinger mean reversion stop loss: `0.6%`
 - Bollinger mean reversion fixed order size: `100`
+- Bollinger mean reversion pyramiding: `3`
 - Partial take profit: `1R`
 - Final take profit: `2R`
 
@@ -155,16 +156,26 @@ Trade management:
 
 Long setup:
 
-- Bollinger Bands use a `20`-bar SMA and `2.0` standard deviations
+- Bollinger Bands use a `20`-bar SMA and `1.7` standard deviations
 - enters long when the close crosses under the lower band
 - long only
 
 Trade management:
 
-- fixed stop loss at `1.5%` below entry
+- fixed stop loss at `0.6%` below entry
 - exits at the Bollinger middle band
 - targets a fixed order size of `100`, capped by available capital in this bot
-- this implementation does not support Pine-style `pyramiding=3`; the bot keeps one open position per symbol
+- supports up to `3` concurrent entries for this strategy in both backtest and live state handling
+- backtest keeps each pyramid layer as its own position; live handling aggregates layers into one symbol-level position with blended average entry and stop
+
+Notes:
+
+- when this strategy is selected, the bot defaults to `1Hour` bars unless you explicitly pass `--timeframe`
+- when this strategy is selected without `--symbols`, the bot defaults to `XAUUSD`
+- `XAUUSD` / `OANDA:XAUUSD` are not fetched from Alpaca in this bot; provide local CSV data such as `data/XAUUSD_1Hour.csv`
+- the original setup was tuned around `OANDA:XAUUSD` on `1 hour`
+- the underlying mean-reversion thesis is intended for roughly `45Min` to `2Hour` charts
+- this bot does not model news-event filters, and it does not add a forced weekend exit for this strategy
 
 ## Data Flow
 

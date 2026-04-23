@@ -101,9 +101,10 @@ class Config:
     mean_reversion_trend_window: int = 100
     mean_reversion_relative_weakness_threshold: float = -0.01
     bb_mean_reversion_window: int = 20
-    bb_mean_reversion_stddev: float = 2.0
-    bb_mean_reversion_stop_loss_pct: float = 0.015
+    bb_mean_reversion_stddev: float = 1.7
+    bb_mean_reversion_stop_loss_pct: float = 0.006
     bb_mean_reversion_order_size: float = 100.0
+    bb_mean_reversion_pyramiding: int = 3
     stop_buffer_pct: float = 0.0025
     partial_take_profit_r: float = 1.0
     final_take_profit_r: float = 2.0
@@ -197,6 +198,18 @@ def parse_timeframe(timeframe: str) -> tuple[int, str]:
     if timeframe.endswith("Day"):
         return int(timeframe[:-3]) * 1_440, "minute"
     raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+
+def canonical_symbol(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+    if ":" in normalized:
+        normalized = normalized.split(":", 1)[1]
+    return normalized
+
+
+def symbol_data_key(symbol: str) -> str:
+    canonical = canonical_symbol(symbol)
+    return canonical.replace("/", "_").replace("-", "_")
 
 
 def annualization_factor(timeframe: str) -> float:
@@ -480,7 +493,7 @@ class DataLoader:
         self.config = config
 
     def load_historical_data(self, symbol: str) -> pd.DataFrame:
-        csv_path = Path(self.config.data_dir) / f"{symbol.replace('/', '_')}_{self.config.timeframe}.csv"
+        csv_path = Path(self.config.data_dir) / f"{symbol_data_key(symbol)}_{self.config.timeframe}.csv"
         if csv_path.exists():
             df = pd.read_csv(csv_path, parse_dates=["timestamp"])
             return self._prepare_with_source(df, symbol, f"local_csv:{csv_path}")
@@ -584,6 +597,11 @@ class DataLoader:
     def _fetch_historical_data(self, symbol: str) -> pd.DataFrame | None:
         if not (self.config.alpaca_api_key and self.config.alpaca_secret_key):
             return None
+        if canonical_symbol(symbol).replace("/", "") == "XAUUSD":
+            raise ValueError(
+                f"{symbol} is not available from the Alpaca market-data path in this bot. "
+                f"Provide local CSV data in {self.config.data_dir}/{symbol_data_key(symbol)}_{self.config.timeframe}.csv."
+            )
         end = datetime.now(UTC)
         start = end - timedelta(days=self.config.lookback_days)
         if ALPACA_AVAILABLE:
@@ -650,7 +668,7 @@ class DataLoader:
         periods = max(self.config.lookback_days * 26, 250)
         end = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
         index = pd.date_range(end=end, periods=periods, freq=timeframe_to_pandas_freq(self.config.timeframe), tz="UTC")
-        seed = sum(ord(char) for char in symbol)
+        seed = sum(ord(char) for char in canonical_symbol(symbol))
         rows: list[dict[str, Any]] = []
         close = 30.0 + (seed % 50)
         for i, ts in enumerate(index):
@@ -726,6 +744,9 @@ class Strategy(ABC):
 
     def exit_signal(self, position: Any, history: pd.DataFrame, config: Config) -> tuple[str, float] | None:
         return None
+
+    def max_concurrent_entries(self, config: Config) -> int:
+        return 1
 
 
 class VWAPMomentumBreakoutStrategy(Strategy):
@@ -901,6 +922,9 @@ class BollingerMeanReversionLongStrategy(Strategy):
         cash_capped_qty = capital_base / signal.entry
         return min(target_qty, cash_capped_qty)
 
+    def max_concurrent_entries(self, config: Config) -> int:
+        return max(config.bb_mean_reversion_pyramiding, 1)
+
     def exit_signal(self, position: Any, history: pd.DataFrame, config: Config) -> tuple[str, float] | None:
         if history.empty:
             return None
@@ -1026,6 +1050,7 @@ class LivePosition:
     stop_price: float
     initial_risk_per_unit: float
     entry_time: pd.Timestamp
+    entry_count: int = 1
     partial_taken: bool = False
     realized_pnl: float = 0.0
     recovery_only: bool = False
@@ -1180,6 +1205,7 @@ class BacktestPosition:
     r_multiple: float = 0.0
     exit_spread_cost: float = 0.0
     exit_slippage: float = 0.0
+    entry_count: int = 1
 
 
 class BacktestEngine:
@@ -1193,7 +1219,7 @@ class BacktestEngine:
         daily_loss = 0.0
         trades_today = 0
         current_day: date | None = None
-        position: BacktestPosition | None = None
+        positions: list[BacktestPosition] = []
         trade_pnls: list[float] = []
         r_multiples: list[float] = []
         equity_points: list[dict[str, Any]] = []
@@ -1211,7 +1237,7 @@ class BacktestEngine:
             source_error = str(data.attrs.get("source_error", "")).strip()
             if source_error:
                 data_source_errors[symbol] = source_error
-            position = None
+            positions = []
             current_day = None
             daily_loss = 0.0
             trades_today = 0
@@ -1225,7 +1251,8 @@ class BacktestEngine:
                     daily_loss = 0.0
                     trades_today = 0
 
-                if position and position.symbol == symbol:
+                next_positions: list[BacktestPosition] = []
+                for position in positions:
                     position_strategy = STRATEGIES[position.strategy]
                     custom_exit = position_strategy.exit_signal(position, history, self.config)
                     if custom_exit is not None:
@@ -1247,23 +1274,28 @@ class BacktestEngine:
                         if closed.exit_time is not None:
                             holding_hours.append((closed.exit_time - closed.entry_time).total_seconds() / 3600.0)
                         self._journal_trade(closed)
-                        position = None
+                    else:
+                        next_positions.append(position)
+                positions = next_positions
 
                 equity_points.append({"timestamp": row["timestamp"], "equity": equity})
-                if position is not None:
-                    continue
                 if trades_today >= self.config.max_trades_per_day:
                     continue
                 if abs(daily_loss) >= equity * self.config.max_daily_loss:
+                    continue
+                symbol_positions = [position for position in positions if position.symbol == symbol and position.strategy == strategy_name]
+                if len(symbol_positions) >= strategy.max_concurrent_entries(self.config):
                     continue
 
                 signal = strategy.generate_signal(symbol, history, self.config, self.config.spread_bps)
                 if signal is None:
                     continue
 
-                custom_qty = strategy.position_size(equity, signal, self.config)
+                reserved_capital = sum(position.open_qty * position.entry_price for position in positions)
+                available_capital = max(equity - reserved_capital, 0.0)
+                custom_qty = strategy.position_size(available_capital, signal, self.config)
                 qty_basis = custom_qty if custom_qty is not None else position_size_from_risk(
-                    equity,
+                    available_capital,
                     signal.entry,
                     signal.stop,
                     self.config.risk_per_trade,
@@ -1280,7 +1312,8 @@ class BacktestEngine:
                 else:
                     entry_fill = signal.entry - spread_half - slip
                 spread_cost, entry_slippage = estimate_costs(signal.entry, qty, self.config.spread_bps, self.config.slippage_bps)
-                position = BacktestPosition(
+                positions.append(
+                    BacktestPosition(
                     symbol=symbol,
                     strategy=strategy_name,
                     side=signal.side,
@@ -1294,12 +1327,13 @@ class BacktestEngine:
                     initial_risk_per_unit=abs(entry_fill - signal.stop),
                     estimated_spread_cost=spread_cost,
                     estimated_entry_slippage=entry_slippage,
+                    )
                 )
                 trades_today += 1
                 bucket = session_bucket(row["timestamp"], self.config)
                 session_bucket_counts[bucket] = session_bucket_counts.get(bucket, 0) + 1
 
-            if position is not None:
+            for position in positions:
                 last_row = data.iloc[-1]
                 closed = self._close_position(position, last_row["timestamp"], float(last_row["close"]), "end_of_data")
                 equity += closed.pnl
@@ -1883,8 +1917,6 @@ class StreamExecutionEngine:
         updated = updated.drop_duplicates("timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
         self.history[symbol] = add_indicators(updated, self.config)
         await self._manage_position(symbol)
-        if symbol in self.broker_state.positions:
-            return
         signal = self.strategy.generate_signal(symbol, self.history[symbol], self.config, self.config.spread_bps)
         if signal is None:
             return
@@ -1892,9 +1924,11 @@ class StreamExecutionEngine:
             self.reconcile_state()
         if not self._can_trade_symbol(symbol):
             return
-        if len(self.broker_state.positions) >= self.config.max_open_positions:
+        if symbol not in self.broker_state.positions and len(self.broker_state.positions) >= self.config.max_open_positions:
             return
-        if symbol in self.broker_state.positions or self.state_machine.has_open_order(symbol, signal.side, "entry"):
+        if self._active_entry_layers(symbol, signal.strategy) >= self.strategy.max_concurrent_entries(self.config):
+            return
+        if self.state_machine.has_open_order(symbol, signal.side, "entry"):
             return
         quote = self._stream_quote_snapshot(symbol)
         if quote is None:
@@ -2102,6 +2136,7 @@ class StreamExecutionEngine:
         if fill_delta <= 0:
             return
         if order.entry_exit == "entry":
+            first_fill_for_order = order.last_processed_fill_qty <= 0
             side = "buy" if order.side == "buy" else "sell"
             existing = self.broker_state.positions.get(order.symbol)
             if existing is None:
@@ -2114,6 +2149,7 @@ class StreamExecutionEngine:
                     stop_price=order.stop_price,
                     initial_risk_per_unit=abs(order.avg_fill_price - order.stop_price),
                     entry_time=order.last_update_time,
+                    entry_count=1,
                     last_fill_time=order.last_update_time,
                 )
             else:
@@ -2122,11 +2158,16 @@ class StreamExecutionEngine:
                     existing.avg_entry_price = (
                         (existing.avg_entry_price * existing.qty) + (order.avg_fill_price * fill_delta)
                     ) / total_qty
+                    if order.stop_price > 0:
+                        existing.stop_price = (
+                            (existing.stop_price * existing.qty) + (order.stop_price * fill_delta)
+                        ) / total_qty
                 existing.qty = total_qty
-                existing.stop_price = order.stop_price or existing.stop_price
                 existing.initial_risk_per_unit = abs(existing.avg_entry_price - existing.stop_price) if existing.stop_price > 0 else existing.initial_risk_per_unit
                 existing.last_fill_time = order.last_update_time
                 existing.strategy = order.strategy
+                if first_fill_for_order:
+                    existing.entry_count += 1
         else:
             position = self.broker_state.positions.get(order.symbol)
             if position is None:
@@ -2150,6 +2191,7 @@ class StreamExecutionEngine:
             deviation_bps = abs(order.avg_fill_price - order.intended_price) / order.intended_price * 10_000.0
             if deviation_bps > self.config.max_slippage_deviation_bps:
                 self.broker_state.recovery_only_symbols.add(order.symbol)
+        order.last_processed_fill_qty = order.filled_qty
 
     def reconcile_state(self) -> None:
         if not (self.config.alpaca_api_key and self.config.alpaca_secret_key):
@@ -2250,6 +2292,7 @@ class StreamExecutionEngine:
                 stop_price=stop_price,
                 initial_risk_per_unit=initial_risk,
                 entry_time=utc_timestamp(persisted_position.get("entry_time")) if persisted_position.get("entry_time") else utc_now(),
+                entry_count=int(persisted_position.get("entry_count") or 1),
                 partial_taken=bool(persisted_position.get("partial_taken", False)),
                 realized_pnl=float(persisted_position.get("realized_pnl") or 0.0),
                 recovery_only=recovery_only,
@@ -2451,6 +2494,18 @@ class StreamExecutionEngine:
             return False
         return True
 
+    def _active_entry_layers(self, symbol: str, strategy_name: str) -> int:
+        layers = 0
+        position = self.broker_state.positions.get(symbol)
+        if position is not None and position.strategy == strategy_name:
+            layers += max(position.entry_count, 1)
+        for order in self.state_machine.orders.values():
+            if order.symbol != symbol or order.strategy != strategy_name or order.entry_exit != "entry":
+                continue
+            if order.status in {"new", "pending_reconcile", "accepted", "partially_filled"}:
+                layers += 1
+        return layers
+
     def _symbol_exposure(self, symbol: str) -> float:
         self._sync_order_reservations()
         exposure = self.broker_state.reserved_notional_by_symbol.get(symbol, 0.0)
@@ -2648,6 +2703,7 @@ class StreamExecutionEngine:
                 "stop_price": position.stop_price,
                 "initial_risk_per_unit": position.initial_risk_per_unit,
                 "entry_time": position.entry_time.isoformat(),
+                "entry_count": position.entry_count,
                 "partial_taken": position.partial_taken,
                 "realized_pnl": position.realized_pnl,
                 "recovery_only": position.recovery_only,
@@ -2838,6 +2894,14 @@ def main() -> None:
         config.starting_capital = args.capital
     if args.timeframe:
         config.timeframe = args.timeframe
+    elif config.strategy == BollingerMeanReversionLongStrategy.name and config.timeframe == "15Min":
+        config.timeframe = "1Hour"
+    if (
+        config.strategy == BollingerMeanReversionLongStrategy.name
+        and not args.symbols
+        and config.symbols == ["AAPL", "MSFT", "AMD"]
+    ):
+        config.symbols = ["XAUUSD"]
     if config.strategy == PremarketRegressionStrategy.name:
         config.symbols = [config.premarket_regression_symbol]
     if config.strategy not in STRATEGIES:
