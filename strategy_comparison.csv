@@ -1,0 +1,3 @@
+strategy,ending_equity,total_return,win_rate,average_r,max_drawdown,trade_count,avg_slippage,avg_spread_cost,avg_holding_time_hours,rejected_trade_count,realized_reward_to_risk,trades_by_session_bucket
+momentum,1016.34,1.63,46.67,0.07,-3.28,45,0.2123,0.4246,11.99,0,1.35,"{""close"": 16, ""midday"": 6, ""open"": 23}"
+mean_reversion,866.77,-13.32,32.11,-0.34,-13.32,109,0.3384,0.6769,0.28,0,0.69,"{""close"": 13, ""midday"": 21, ""open"": 75}"
