@@ -10,6 +10,8 @@ The current version supports:
 - Strategy comparison across multiple strategies
 - Alpaca paper trading
 - Alpaca live trading
+- Scheduled paper trading sessions
+- Scheduled live trading sessions
 - Fractional position sizing for small accounts
 - CSV trade journaling
 
@@ -17,6 +19,7 @@ Implemented strategies:
 
 - `momentum` (default): VWAP momentum breakout
 - `mean_reversion`: simple z-score reversion strategy
+- `premarket_regression`: trades SPY from a 2-hour premarket regression signal into the close
 
 The script has been smoke-tested locally with:
 
@@ -31,6 +34,14 @@ The script has been smoke-tested locally with:
 - `trade_journal.csv`: created automatically when trades are logged
 - `trade_journal_momentum.csv` / `trade_journal_mean_reversion.csv`: created automatically during compare runs
 - `data/<SYMBOL>_<TIMEFRAME>.csv`: optional local historical data input
+
+Backtest data source priority:
+
+1. local CSV in `data/`
+2. Alpaca historical bars
+3. synthetic sample data as a fallback
+
+Backtest mode now prints the resolved source per symbol and warns explicitly when it falls back to synthetic data.
 
 ## Install
 
@@ -78,6 +89,10 @@ Current defaults:
 - EMA fast/slow: `9 / 20`
 - RVOL threshold: `1.5`
 - Mean reversion z-score: `1.2`
+- Bollinger mean reversion window: `20`
+- Bollinger mean reversion std-dev: `2.0`
+- Bollinger mean reversion stop loss: `1.5%`
+- Bollinger mean reversion fixed order size: `100`
 - Partial take profit: `1R`
 - Final take profit: `2R`
 
@@ -119,6 +134,38 @@ Short setup:
 
 Trade management uses the same risk model and exit engine.
 
+### `premarket_regression`
+
+Long setup:
+
+- uses `SPY`
+- computes the linear regression slope across the last 2 hours of premarket closes
+- buys on the first regular-session bar close when the slope is positive
+
+Short setup:
+
+- sells on the first regular-session bar close when the slope is negative
+
+Trade management:
+
+- allocates 100% of configured capital by default
+- exits near the regular market close
+
+### `bb_mean_reversion_long`
+
+Long setup:
+
+- Bollinger Bands use a `20`-bar SMA and `2.0` standard deviations
+- enters long when the close crosses under the lower band
+- long only
+
+Trade management:
+
+- fixed stop loss at `1.5%` below entry
+- exits at the Bollinger middle band
+- targets a fixed order size of `100`, capped by available capital in this bot
+- this implementation does not support Pine-style `pyramiding=3`; the bot keeps one open position per symbol
+
 ## Data Flow
 
 ```text
@@ -144,6 +191,10 @@ Alternative strategy:
 
 ```bash
 .venv/bin/python microcapital_trader.py --mode backtest --strategy mean_reversion
+```
+
+```bash
+.venv/bin/python microcapital_trader.py --mode backtest --strategy bb_mean_reversion_long
 ```
 
 Override capital and symbols:
@@ -203,6 +254,26 @@ ALPACA_BASE_URL=https://api.alpaca.markets
 ```bash
 ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live --strategy momentum --symbols AAPL
 ```
+
+### 5. Scheduled paper session
+
+The scheduled modes wait until the configured pre-open window, start the stream engine automatically, flatten positions shortly before the close, and exit after the close.
+
+```bash
+.venv/bin/python microcapital_trader.py --mode scheduled_paper --strategy premarket_regression
+```
+
+### 6. Scheduled live session
+
+```bash
+ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode scheduled_live --strategy premarket_regression
+```
+
+Scheduler defaults in `Config`:
+
+- start `30` minutes before the market open
+- flatten `1` minute before the market close
+- shut down `5` minutes after the market close
 
 ## Optional Local Data Files
 
@@ -264,8 +335,8 @@ mean_reversion        -30.81      9.26      -0.66        -30.81     108
 
 Available flags:
 
-- `--mode {backtest,paper,live}`
-- `--strategy {momentum,mean_reversion}`
+- `--mode {backtest,paper,live,scheduled_paper,scheduled_live}`
+- `--strategy {momentum,mean_reversion,premarket_regression}`
 - `--compare`
 - `--symbols SYMBOL [SYMBOL ...]`
 - `--capital FLOAT`
@@ -274,7 +345,9 @@ Available flags:
 ## Safety Notes
 
 - `paper` and `live` require Alpaca credentials
+- `scheduled_paper` and `scheduled_live` also require Alpaca credentials
 - `live` requires `ALLOW_LIVE=true`
+- `scheduled_live` also requires `ALLOW_LIVE=true`
 - position sizing is capped by available account equity
 - the current execution path submits market orders only
 - short logic exists in the backtest and signal engine, but live tradability depends on your Alpaca account permissions
@@ -283,6 +356,6 @@ Available flags:
 
 - single-script implementation by design
 - no portfolio optimizer or advanced framework
-- no async or scheduling loop
+- scheduling depends on Alpaca market calendar access and falls back to weekday assumptions if the calendar endpoint is unavailable
 - no persistent state beyond CSV journals
 - offline backtests may use synthetic sample data if no local CSV or Alpaca credentials are available

@@ -1,0 +1,1 @@
+timestamp,symbol,strategy,side,mode,event,entry_exit,stop,size,signal_price,intended_price,fill_price,slippage,spread_cost,execution_cost,pnl,r_multiple,session_bucket,client_order_id,order_status,filled_qty,remaining_qty,rejection_reason,notes
