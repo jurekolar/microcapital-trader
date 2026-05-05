@@ -81,10 +81,10 @@ The bot uses a single `Config` dataclass inside [microcapital_trader.py](/Users/
 Current defaults:
 
 - Starting capital: `$1,000`
-- Risk per trade: `0.5%`
-- Max daily loss: `2%`
+- Risk per trade: `5.0%`
+- Max daily loss: `10%`
 - Max trades per day: `4`
-- Symbols: `AAPL MSFT AMD`
+- Symbols: `TQQQ MSFT ORCL NET PYPL CAT NFLX INTC PLTR AMZN NOW BABA ARM CRWD QCOM`
 - Timeframe: `15Min`
 - Strategy: `momentum`
 - Breakout lookback: `20`
@@ -93,6 +93,9 @@ Current defaults:
 - RVOL threshold: `1.5`
 - Partial take profit: `1R`
 - Final take profit: `2R`
+- Max position notional: `$1,000`
+- Max symbol exposure: `$1,000`
+- Max gross exposure: `$3,000`
 
 To change defaults, edit the `Config` dataclass directly.
 

@@ -74,12 +74,30 @@ class Config:
     mode: str = "backtest"
     asset_class: str = "equity"
     strategy: str = "momentum"
-    symbols: list[str] = field(default_factory=lambda: ["AAPL", "MSFT", "AMD"])
+    symbols: list[str] = field(
+        default_factory=lambda: [
+            "TQQQ",
+            "MSFT",
+            "ORCL",
+            "NET",
+            "PYPL",
+            "CAT",
+            "NFLX",
+            "INTC",
+            "PLTR",
+            "AMZN",
+            "NOW",
+            "BABA",
+            "ARM",
+            "CRWD",
+            "QCOM",
+        ]
+    )
     timeframe: str = "15Min"
     lookback_days: int = 30
     starting_capital: float = 1_000.0
-    risk_per_trade: float = 0.005
-    max_daily_loss: float = 0.02
+    risk_per_trade: float = 0.05
+    max_daily_loss: float = 0.10
     max_trades_per_day: int = 4
     max_open_positions: int = 3
     max_symbols_per_run: int = 3
@@ -115,9 +133,9 @@ class Config:
     stream_startup_grace_seconds: int = 45
     websocket_ping_interval_seconds: int = 20
     websocket_ping_timeout_seconds: int = 60
-    max_gross_exposure: float = 900.0
-    max_symbol_exposure: float = 300.0
-    max_position_notional: float = 300.0
+    max_gross_exposure: float = 3_000.0
+    max_symbol_exposure: float = 1_000.0
+    max_position_notional: float = 1_000.0
     max_spread_bps_live: float = 12.0
     max_slippage_deviation_bps: float = 20.0
     cooldown_minutes_after_rejection: int = 30
@@ -146,8 +164,9 @@ class Config:
             alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
             alpaca_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
             asset_class=os.getenv("ASSET_CLASS", "equity"),
-            symbols=[s.strip() for s in os.getenv("SYMBOLS", "AAPL,MSFT,AMD").split(",") if s.strip()],
         )
+        if os.getenv("SYMBOLS"):
+            config.symbols = [s.strip() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
         if os.getenv("MODE"):
             config.mode = os.getenv("MODE", config.mode)
         if os.getenv("RISK_PER_TRADE"):
