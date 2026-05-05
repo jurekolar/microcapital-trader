@@ -1,25 +1,23 @@
 # microcapital-trader
 
-Lightweight trading bot for small accounts, built around a single Python script: [microcapital_trader.py](/Users/jurekolar/Code/microcapital-trader/microcapital_trader.py).
+Lightweight momentum trading bot for small accounts, built around a single Python script: [microcapital_trader.py](/Users/jurekolar/Code/microcapital-trader/microcapital_trader.py).
 
 ## Current State
 
 The current version supports:
 
-- Backtesting
-- Strategy comparison across multiple strategies
+- Momentum backtesting
+- One-strategy comparison output for momentum
 - Alpaca paper trading
 - Alpaca live trading
 - Scheduled paper trading sessions
 - Scheduled live trading sessions
 - Fractional position sizing for small accounts
-- CSV trade journaling
+- CSV trade and order journaling
 
-Implemented strategies:
+Implemented strategy:
 
-- `momentum` (default): VWAP momentum breakout
-- `mean_reversion`: simple z-score reversion strategy
-- `premarket_regression`: trades SPY from a 2-hour premarket regression signal into the close
+- `momentum`: VWAP momentum breakout with EMA, relative-volume, and candle-close filters
 
 The script has been smoke-tested locally with:
 
@@ -31,17 +29,19 @@ The script has been smoke-tested locally with:
 
 - [microcapital_trader.py](/Users/jurekolar/Code/microcapital-trader/microcapital_trader.py): main bot script
 - [requirements.txt](/Users/jurekolar/Code/microcapital-trader/requirements.txt): runtime dependencies
-- `trade_journal.csv`: created automatically when trades are logged
-- `trade_journal_momentum.csv` / `trade_journal_mean_reversion.csv`: created automatically during compare runs
+- `trade_journal.csv`: created automatically when trades or order events are logged
+- `trade_journal_momentum.csv`: created automatically during compare runs
+- `strategy_comparison.csv`: created automatically by compare mode
+- `live_state.json`: local live/paper order and position state
 - `data/<SYMBOL>_<TIMEFRAME>.csv`: optional local historical data input
 
 Backtest data source priority:
 
 1. local CSV in `data/`
-2. Alpaca historical bars
+2. Alpaca historical bars for Alpaca-supported symbols
 3. synthetic sample data as a fallback
 
-Backtest mode now prints the resolved source per symbol and warns explicitly when it falls back to synthetic data.
+Backtest mode prints the resolved source per symbol and warns explicitly when it falls back to synthetic data.
 
 ## Install
 
@@ -55,6 +55,7 @@ Dependencies:
 - `pandas`
 - `requests`
 - `python-dotenv`
+- `alpaca-py`
 
 ## Environment Variables
 
@@ -71,6 +72,7 @@ Notes:
 - For paper trading, use `https://paper-api.alpaca.markets`
 - For live trading, use `https://api.alpaca.markets`
 - Live mode is additionally gated by `ALLOW_LIVE=true`
+- Optional overrides include `MODE`, `SYMBOLS`, `ASSET_CLASS`, `RISK_PER_TRADE`, `SLIPPAGE_BPS`, `SPREAD_BPS`, and `TIMEFRAME`
 
 ## Default Configuration
 
@@ -84,16 +86,11 @@ Current defaults:
 - Max trades per day: `4`
 - Symbols: `AAPL MSFT AMD`
 - Timeframe: `15Min`
-- Default strategy: `momentum`
+- Strategy: `momentum`
 - Breakout lookback: `20`
 - EMA fast/slow: `9 / 20`
+- VWAP window: `30`
 - RVOL threshold: `1.5`
-- Mean reversion z-score: `1.2`
-- Bollinger mean reversion window: `20`
-- Bollinger mean reversion std-dev: `1.7`
-- Bollinger mean reversion stop loss: `0.6%`
-- Bollinger mean reversion fixed order size: `100`
-- Bollinger mean reversion pyramiding: `3`
 - Partial take profit: `1R`
 - Final take profit: `2R`
 
@@ -113,114 +110,51 @@ Long setup:
 
 Short setup:
 
-- reverse of the long logic
+- price below VWAP
+- EMA 9 below EMA 20
+- close below recent low
+- relative volume above `1.5`
+- weak candle close
+- disabled for crypto
 
 Trade management:
 
-- stop below breakout structure
+- stop beyond breakout structure
 - partial profit at `1R`
 - remaining position exits at `2R` or EMA structure break
-
-### `mean_reversion`
-
-Long setup:
-
-- z-score below negative threshold
-- price below VWAP
-
-Short setup:
-
-- z-score above positive threshold
-- price above VWAP
-
-Trade management uses the same risk model and exit engine.
-
-### `premarket_regression`
-
-Long setup:
-
-- uses `SPY`
-- computes the linear regression slope across the last 2 hours of premarket closes
-- buys on the first regular-session bar close when the slope is positive
-
-Short setup:
-
-- sells on the first regular-session bar close when the slope is negative
-
-Trade management:
-
-- allocates 100% of configured capital by default
-- exits near the regular market close
-
-### `bb_mean_reversion_long`
-
-Long setup:
-
-- Bollinger Bands use a `20`-bar SMA and `1.7` standard deviations
-- enters long when the close crosses under the lower band
-- long only
-
-Trade management:
-
-- fixed stop loss at `0.6%` below entry
-- exits at the Bollinger middle band
-- targets a fixed order size of `100`, capped by available capital in this bot
-- supports up to `3` concurrent entries for this strategy in both backtest and live state handling
-- backtest keeps each pyramid layer as its own position; live handling aggregates layers into one symbol-level position with blended average entry and stop
-
-Notes:
-
-- when this strategy is selected, the bot defaults to `1Hour` bars unless you explicitly pass `--timeframe`
-- when this strategy is selected without `--symbols`, the bot defaults to `XAUUSD`
-- `XAUUSD` / `OANDA:XAUUSD` are not fetched from Alpaca in this bot; provide local CSV data such as `data/XAUUSD_1Hour.csv`
-- the original setup was tuned around `OANDA:XAUUSD` on `1 hour`
-- the underlying mean-reversion thesis is intended for roughly `45Min` to `2Hour` charts
-- this bot does not model news-event filters, and it does not add a forced weekend exit for this strategy
 
 ## Data Flow
 
 ```text
 historical data / Alpaca bars
 -> indicators
--> strategy signal
+-> momentum signal
 -> position sizing and risk checks
 -> backtest engine or Alpaca execution
--> CSV journal
+-> CSV journal and local live state
 ```
 
 ## Usage
 
 ### 1. Run a backtest
 
-Default strategy:
-
 ```bash
-.venv/bin/python microcapital_trader.py --mode backtest --strategy momentum
-```
-
-Alternative strategy:
-
-```bash
-.venv/bin/python microcapital_trader.py --mode backtest --strategy mean_reversion
-```
-
-```bash
-.venv/bin/python microcapital_trader.py --mode backtest --strategy bb_mean_reversion_long
+.venv/bin/python microcapital_trader.py --mode backtest
 ```
 
 Override capital and symbols:
 
 ```bash
-.venv/bin/python microcapital_trader.py --mode backtest --strategy momentum --capital 1500 --symbols AAPL NVDA
+.venv/bin/python microcapital_trader.py --mode backtest --capital 1500 --symbols AAPL NVDA
 ```
 
 Override timeframe:
 
 ```bash
-.venv/bin/python microcapital_trader.py --mode backtest --strategy momentum --timeframe 1Hour
+.venv/bin/python microcapital_trader.py --mode backtest --timeframe 1Hour
 ```
 
-### 2. Compare strategies
+### 2. Write a momentum comparison report
 
 ```bash
 .venv/bin/python microcapital_trader.py --mode backtest --compare
@@ -233,19 +167,26 @@ Current comparison metrics:
 - average R
 - max drawdown
 - number of trades
+- average slippage
+- average spread cost
+- average holding time
+- rejected trade count
+- realized reward:risk
+- data sources
+- trades by session bucket
 
 ### 3. Paper trade with Alpaca
 
 Set `.env` to paper API credentials and paper base URL, then run:
 
 ```bash
-.venv/bin/python microcapital_trader.py --mode paper --strategy momentum
+.venv/bin/python microcapital_trader.py --mode paper
 ```
 
 Example:
 
 ```bash
-.venv/bin/python microcapital_trader.py --mode paper --strategy momentum --symbols AAPL MSFT
+.venv/bin/python microcapital_trader.py --mode paper --symbols AAPL MSFT
 ```
 
 ### 4. Live trade with Alpaca
@@ -253,7 +194,7 @@ Example:
 Live mode is intentionally separated and blocked unless `ALLOW_LIVE=true` is set.
 
 ```bash
-ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live --strategy momentum
+ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live
 ```
 
 Example with explicit live base URL in `.env`:
@@ -263,7 +204,7 @@ ALPACA_BASE_URL=https://api.alpaca.markets
 ```
 
 ```bash
-ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live --strategy momentum --symbols AAPL
+ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live --symbols AAPL
 ```
 
 ### 5. Scheduled paper session
@@ -271,13 +212,13 @@ ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live --strategy m
 The scheduled modes wait until the configured pre-open window, start the stream engine automatically, flatten positions shortly before the close, and exit after the close.
 
 ```bash
-.venv/bin/python microcapital_trader.py --mode scheduled_paper --strategy premarket_regression
+.venv/bin/python microcapital_trader.py --mode scheduled_paper
 ```
 
 ### 6. Scheduled live session
 
 ```bash
-ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode scheduled_live --strategy premarket_regression
+ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode scheduled_live
 ```
 
 Scheduler defaults in `Config`:
@@ -305,38 +246,26 @@ timestamp,open,high,low,close,volume
 
 ## Output and Journaling
 
-Trades are logged to CSV with these fields:
+Trades and order events are logged to CSV with these fields:
 
-- `timestamp`
-- `symbol`
-- `strategy`
-- `side`
-- `entry`
-- `stop`
-- `exit`
-- `size`
-- `pnl`
-- `r_multiple`
+```text
+timestamp,symbol,strategy,side,mode,event,entry_exit,stop,size,signal_price,intended_price,fill_price,slippage,spread_cost,execution_cost,pnl,r_multiple,session_bucket,client_order_id,order_status,filled_qty,remaining_qty,rejection_reason,notes
+```
 
-Backtest mode prints a simple summary like:
+Backtest mode prints a summary like:
 
 ```text
 Strategy: momentum
-Ending equity: $1641.60
-Total return: 64.16%
-Win rate: 90.11%
-Average R: 1.08
-Max drawdown: -0.52%
-Trades: 91
+Data sources: {"AAPL": "synthetic_sample"}
+Ending equity: $1008.42
+Total return: 0.84%
+Win rate: 50.00%
+Average R: 0.12
+Max drawdown: -1.34%
+Trade count: 10
 ```
 
-Compare mode prints a table like:
-
-```text
-      strategy  total_return  win_rate  average_r  max_drawdown  trades
-      momentum         64.16     90.11       1.08         -0.52      91
-mean_reversion        -30.81      9.26      -0.66        -30.81     108
-```
+Compare mode prints the same momentum metrics and writes one row to `strategy_comparison.csv`.
 
 ## CLI Reference
 
@@ -347,11 +276,12 @@ mean_reversion        -30.81      9.26      -0.66        -30.81     108
 Available flags:
 
 - `--mode {backtest,paper,live,scheduled_paper,scheduled_live}`
-- `--strategy {momentum,mean_reversion,premarket_regression}`
+- `--asset-class {equity,crypto}`
 - `--compare`
 - `--symbols SYMBOL [SYMBOL ...]`
 - `--capital FLOAT`
 - `--timeframe VALUE`
+- `--show-plan`
 
 ## Safety Notes
 
@@ -368,5 +298,4 @@ Available flags:
 - single-script implementation by design
 - no portfolio optimizer or advanced framework
 - scheduling depends on Alpaca market calendar access and falls back to weekday assumptions if the calendar endpoint is unavailable
-- no persistent state beyond CSV journals
 - offline backtests may use synthetic sample data if no local CSV or Alpaca credentials are available

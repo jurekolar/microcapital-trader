@@ -41,9 +41,9 @@ except ImportError:  # pragma: no cover - optional dependency path
 
 
 PLAN_TEXT = """Implementation plan
-- Modules/classes: Config, Journal, DataLoader, Strategy base, VWAPMomentumBreakoutStrategy, MeanReversionStrategy, BacktestEngine, OrderStateMachine, BrokerState, EquitiesExecutor, CryptoExecutor, StreamExecutionEngine, TradingBot.
+- Modules/classes: Config, Journal, DataLoader, Strategy base, VWAPMomentumBreakoutStrategy, BacktestEngine, OrderStateMachine, BrokerState, EquitiesExecutor, CryptoExecutor, StreamExecutionEngine, TradingBot.
 - Data flow: historical/stream data -> indicators/bar aggregation -> strategy signal on bar close -> order intent/submission -> broker updates/fills -> order/position state -> CSV journal and backtest metrics.
-- Strategy plug-in: strategies expose generate_signal(history, symbol, config, spread_bps); bot selects from STRATEGIES by name and can compare them in backtests.
+- Strategy: momentum exposes generate_signal(history, symbol, config, spread_bps); compare mode reports the same momentum path.
 - Modes: backtest replays bars with modeled spread/slippage; paper/live use Alpaca REST for startup/reconcile/order submit and WebSocket streams for market/order events.
 - WebSocket execution: market data stream feeds bar aggregation, closed bars trigger signals, trading stream feeds order state transitions and fills.
 - State machine: explicit new/accepted/partially_filled/filled/canceled/rejected transitions with validation; positions are rebuilt from actual fills only.
@@ -74,7 +74,6 @@ class Config:
     mode: str = "backtest"
     asset_class: str = "equity"
     strategy: str = "momentum"
-    compare_strategies: list[str] = field(default_factory=lambda: ["momentum", "mean_reversion", "bb_mean_reversion_long", "premarket_regression"])
     symbols: list[str] = field(default_factory=lambda: ["AAPL", "MSFT", "AMD"])
     timeframe: str = "15Min"
     lookback_days: int = 30
@@ -96,15 +95,6 @@ class Config:
     rvol_window: int = 20
     rvol_threshold: float = 1.5
     candle_body_threshold: float = 0.6
-    mean_reversion_window: int = 20
-    mean_reversion_zscore: float = 1.2
-    mean_reversion_trend_window: int = 100
-    mean_reversion_relative_weakness_threshold: float = -0.01
-    bb_mean_reversion_window: int = 20
-    bb_mean_reversion_stddev: float = 1.7
-    bb_mean_reversion_stop_loss_pct: float = 0.006
-    bb_mean_reversion_order_size: float = 100.0
-    bb_mean_reversion_pyramiding: int = 3
     stop_buffer_pct: float = 0.0025
     partial_take_profit_r: float = 1.0
     final_take_profit_r: float = 2.0
@@ -139,9 +129,6 @@ class Config:
     market_open_minute_local: int = 30
     market_close_hour_local: int = 16
     market_close_minute_local: int = 0
-    premarket_regression_symbol: str = "SPY"
-    premarket_regression_lookback_minutes: int = 120
-    premarket_regression_allocation_fraction: float = 1.0
     schedule_start_minutes_before_open: int = 30
     schedule_flatten_minutes_before_close: int = 1
     schedule_shutdown_minutes_after_close: int = 5
@@ -163,8 +150,6 @@ class Config:
         )
         if os.getenv("MODE"):
             config.mode = os.getenv("MODE", config.mode)
-        if os.getenv("STRATEGY"):
-            config.strategy = os.getenv("STRATEGY", config.strategy)
         if os.getenv("RISK_PER_TRADE"):
             config.risk_per_trade = float(os.getenv("RISK_PER_TRADE", config.risk_per_trade))
         if os.getenv("SLIPPAGE_BPS"):
@@ -173,8 +158,6 @@ class Config:
             config.spread_bps = float(os.getenv("SPREAD_BPS", config.spread_bps))
         if os.getenv("TIMEFRAME"):
             config.timeframe = os.getenv("TIMEFRAME", config.timeframe)
-        if os.getenv("PREMARKET_REGRESSION_SYMBOL"):
-            config.premarket_regression_symbol = os.getenv("PREMARKET_REGRESSION_SYMBOL", config.premarket_regression_symbol).strip().upper()
         return config
 
 
@@ -362,24 +345,6 @@ def market_session_bounds(ts: pd.Timestamp, config: Config) -> tuple[pd.Timestam
     return open_local.tz_convert("UTC"), close_local.tz_convert("UTC")
 
 
-def linear_regression_slope(values: pd.Series) -> float:
-    numeric = pd.to_numeric(values, errors="coerce").dropna().astype("float64")
-    count = len(numeric)
-    if count < 2:
-        return 0.0
-    x_mean = (count - 1) / 2.0
-    y_mean = float(numeric.mean())
-    numerator = 0.0
-    denominator = 0.0
-    for idx, value in enumerate(numeric):
-        dx = idx - x_mean
-        numerator += dx * (value - y_mean)
-        denominator += dx * dx
-    if denominator == 0:
-        return 0.0
-    return numerator / denominator
-
-
 def deterministic_client_order_id(
     mode: str,
     strategy: str,
@@ -447,19 +412,6 @@ def add_indicators(df: pd.DataFrame, config: Config) -> pd.DataFrame:
     data["weak_close"] = weak_close_fraction(data)
     data["recent_high"] = data["high"].rolling(config.breakout_lookback).max().shift(1)
     data["recent_low"] = data["low"].rolling(config.breakout_lookback).min().shift(1)
-    data["mean"] = data["close"].rolling(config.mean_reversion_window).mean()
-    data["std"] = data["close"].rolling(config.mean_reversion_window).std()
-    data["zscore"] = (data["close"] - data["mean"]) / data["std"].replace(0, pd.NA)
-    data["trend_mean"] = data["close"].rolling(config.mean_reversion_trend_window).mean()
-    data["trend_relative"] = (data["close"] / data["trend_mean"]) - 1.0
-    data["bb_middle"] = data["close"].rolling(config.bb_mean_reversion_window).mean()
-    data["bb_std"] = data["close"].rolling(config.bb_mean_reversion_window).std()
-    band_width = data["bb_std"] * config.bb_mean_reversion_stddev
-    data["bb_upper"] = data["bb_middle"] + band_width
-    data["bb_lower"] = data["bb_middle"] - band_width
-    previous_close = data["close"].shift(1)
-    previous_lower = data["bb_lower"].shift(1)
-    data["bb_long_entry"] = (previous_close >= previous_lower) & (data["close"] < data["bb_lower"])
     return data
 
 
@@ -597,11 +549,6 @@ class DataLoader:
     def _fetch_historical_data(self, symbol: str) -> pd.DataFrame | None:
         if not (self.config.alpaca_api_key and self.config.alpaca_secret_key):
             return None
-        if canonical_symbol(symbol).replace("/", "") == "XAUUSD":
-            raise ValueError(
-                f"{symbol} is not available from the Alpaca market-data path in this bot. "
-                f"Provide local CSV data in {self.config.data_dir}/{symbol_data_key(symbol)}_{self.config.timeframe}.csv."
-            )
         end = datetime.now(UTC)
         start = end - timedelta(days=self.config.lookback_days)
         if ALPACA_AVAILABLE:
@@ -739,15 +686,6 @@ class Strategy(ABC):
     ) -> Signal | None:
         raise NotImplementedError
 
-    def position_size(self, capital_base: float, signal: Signal, config: Config) -> float | None:
-        return None
-
-    def exit_signal(self, position: Any, history: pd.DataFrame, config: Config) -> tuple[str, float] | None:
-        return None
-
-    def max_concurrent_entries(self, config: Config) -> int:
-        return 1
-
 
 class VWAPMomentumBreakoutStrategy(Strategy):
     name = "momentum"
@@ -818,196 +756,8 @@ class VWAPMomentumBreakoutStrategy(Strategy):
         return None
 
 
-class MeanReversionStrategy(Strategy):
-    name = "mean_reversion"
-
-    def generate_signal(
-        self,
-        symbol: str,
-        history: pd.DataFrame,
-        config: Config,
-        estimated_spread_bps: float,
-    ) -> Signal | None:
-        row = history.iloc[-1]
-        if any(pd.isna(row[key]) for key in ["zscore", "mean", "vwap", "trend_relative"]):
-            return None
-        bar_time = row["timestamp"]
-        if not within_session(bar_time, config):
-            return None
-
-        if (
-            row["zscore"] <= -config.mean_reversion_zscore
-            and row["close"] < row["vwap"]
-            and row["trend_relative"] >= config.mean_reversion_relative_weakness_threshold
-        ):
-            stop = row["low"] * (1.0 - config.stop_buffer_pct)
-            risk = row["close"] - stop
-            if stop < row["close"] and risk > 0 and estimated_spread_bps <= config.spread_bps * 1.5:
-                return Signal(
-                    strategy=self.name,
-                    symbol=symbol,
-                    side="buy",
-                    entry=float(row["close"]),
-                    stop=float(stop),
-                    target_1=float(row["mean"]),
-                    target_2=float(max(row["mean"], row["close"] + risk * config.final_take_profit_r)),
-                    reason="mean_reversion_long",
-                    bar_time=bar_time,
-                )
-
-        if (
-            config.allow_short
-            and config.asset_class != "crypto"
-            and row["zscore"] >= config.mean_reversion_zscore
-            and row["close"] > row["vwap"]
-            and row["trend_relative"] <= abs(config.mean_reversion_relative_weakness_threshold)
-        ):
-            stop = row["high"] * (1.0 + config.stop_buffer_pct)
-            risk = stop - row["close"]
-            if stop > row["close"] and risk > 0 and estimated_spread_bps <= config.spread_bps * 1.5:
-                return Signal(
-                    strategy=self.name,
-                    symbol=symbol,
-                    side="sell",
-                    entry=float(row["close"]),
-                    stop=float(stop),
-                    target_1=float(row["mean"]),
-                    target_2=float(min(row["mean"], row["close"] - risk * config.final_take_profit_r)),
-                    reason="mean_reversion_short",
-                    bar_time=bar_time,
-                )
-        return None
-
-
-class BollingerMeanReversionLongStrategy(Strategy):
-    name = "bb_mean_reversion_long"
-
-    def generate_signal(
-        self,
-        symbol: str,
-        history: pd.DataFrame,
-        config: Config,
-        estimated_spread_bps: float,
-    ) -> Signal | None:
-        row = history.iloc[-1]
-        if any(pd.isna(row[key]) for key in ["bb_middle", "bb_lower", "bb_long_entry"]):
-            return None
-        bar_time = row["timestamp"]
-        if not within_session(bar_time, config):
-            return None
-        if estimated_spread_bps > config.spread_bps * 1.5:
-            return None
-        if not bool(row["bb_long_entry"]):
-            return None
-
-        stop = float(row["close"] * (1.0 - config.bb_mean_reversion_stop_loss_pct))
-        if stop >= row["close"]:
-            return None
-        return Signal(
-            strategy=self.name,
-            symbol=symbol,
-            side="buy",
-            entry=float(row["close"]),
-            stop=stop,
-            target_1=float(row["bb_middle"]),
-            target_2=float(row["bb_middle"]),
-            reason="bb_mean_reversion_long",
-            bar_time=bar_time,
-        )
-
-    def position_size(self, capital_base: float, signal: Signal, config: Config) -> float | None:
-        if signal.entry <= 0 or capital_base <= 0:
-            return 0.0
-        target_qty = max(config.bb_mean_reversion_order_size, 0.0)
-        cash_capped_qty = capital_base / signal.entry
-        return min(target_qty, cash_capped_qty)
-
-    def max_concurrent_entries(self, config: Config) -> int:
-        return max(config.bb_mean_reversion_pyramiding, 1)
-
-    def exit_signal(self, position: Any, history: pd.DataFrame, config: Config) -> tuple[str, float] | None:
-        if history.empty:
-            return None
-        row = history.iloc[-1]
-        if pd.isna(row["bb_middle"]):
-            return None
-        if row["low"] <= position.stop_price:
-            return "stop_loss", float(position.stop_price)
-        if row["high"] >= row["bb_middle"]:
-            return "middle_band_target", float(row["bb_middle"])
-        return None
-
-
-class PremarketRegressionStrategy(Strategy):
-    name = "premarket_regression"
-
-    def generate_signal(
-        self,
-        symbol: str,
-        history: pd.DataFrame,
-        config: Config,
-        estimated_spread_bps: float,
-    ) -> Signal | None:
-        target_symbol = config.premarket_regression_symbol.upper()
-        if symbol.upper() != target_symbol or history.empty:
-            return None
-        row = history.iloc[-1]
-        bar_time = utc_timestamp(row["timestamp"])
-        market_open, _ = market_session_bounds(bar_time, config)
-        timeframe_minutes, _ = parse_timeframe(config.timeframe)
-        entry_cutoff = market_open + pd.Timedelta(minutes=timeframe_minutes)
-        if bar_time < market_open or bar_time >= entry_cutoff:
-            return None
-
-        lookback_start = market_open - pd.Timedelta(minutes=config.premarket_regression_lookback_minutes)
-        premarket = history[(history["timestamp"] >= lookback_start) & (history["timestamp"] < market_open)].copy()
-        if len(premarket) < 2:
-            return None
-
-        slope = linear_regression_slope(premarket["close"])
-        if slope > 0:
-            side = "buy"
-            stop = float(min(premarket["low"].min(), row["close"] * (1.0 - config.stop_buffer_pct)))
-        elif slope < 0 and config.allow_short and config.asset_class != "crypto":
-            side = "sell"
-            stop = float(max(premarket["high"].max(), row["close"] * (1.0 + config.stop_buffer_pct)))
-        else:
-            return None
-
-        return Signal(
-            strategy=self.name,
-            symbol=target_symbol,
-            side=side,
-            entry=float(row["close"]),
-            stop=stop,
-            target_1=float(row["close"]),
-            target_2=float(row["close"]),
-            reason=f"premarket_regression_{'long' if side == 'buy' else 'short'}",
-            bar_time=bar_time,
-        )
-
-    def position_size(self, capital_base: float, signal: Signal, config: Config) -> float | None:
-        allocation = max(min(config.premarket_regression_allocation_fraction, 1.0), 0.0)
-        if capital_base <= 0 or signal.entry <= 0 or allocation <= 0:
-            return 0.0
-        return (capital_base * allocation) / signal.entry
-
-    def exit_signal(self, position: Any, history: pd.DataFrame, config: Config) -> tuple[str, float] | None:
-        if history.empty:
-            return None
-        row = history.iloc[-1]
-        bar_time = utc_timestamp(row["timestamp"])
-        _, market_close = market_session_bounds(bar_time, config)
-        if bar_time >= market_close:
-            return "market_close", float(row["close"])
-        return None
-
-
 STRATEGIES: dict[str, Strategy] = {
     VWAPMomentumBreakoutStrategy.name: VWAPMomentumBreakoutStrategy(),
-    MeanReversionStrategy.name: MeanReversionStrategy(),
-    BollingerMeanReversionLongStrategy.name: BollingerMeanReversionLongStrategy(),
-    PremarketRegressionStrategy.name: PremarketRegressionStrategy(),
 }
 
 
@@ -1050,7 +800,6 @@ class LivePosition:
     stop_price: float
     initial_risk_per_unit: float
     entry_time: pd.Timestamp
-    entry_count: int = 1
     partial_taken: bool = False
     realized_pnl: float = 0.0
     recovery_only: bool = False
@@ -1205,7 +954,6 @@ class BacktestPosition:
     r_multiple: float = 0.0
     exit_spread_cost: float = 0.0
     exit_slippage: float = 0.0
-    entry_count: int = 1
 
 
 class BacktestEngine:
@@ -1213,8 +961,8 @@ class BacktestEngine:
         self.config = config
         self.journal = journal
 
-    def run(self, strategy_name: str) -> dict[str, Any]:
-        strategy = STRATEGIES[strategy_name]
+    def run(self) -> dict[str, Any]:
+        strategy = STRATEGIES[self.config.strategy]
         equity = self.config.starting_capital
         daily_loss = 0.0
         trades_today = 0
@@ -1253,17 +1001,7 @@ class BacktestEngine:
 
                 next_positions: list[BacktestPosition] = []
                 for position in positions:
-                    position_strategy = STRATEGIES[position.strategy]
-                    custom_exit = position_strategy.exit_signal(position, history, self.config)
-                    if custom_exit is not None:
-                        reason, exit_price = custom_exit
-                        closed = self._close_position(position, row["timestamp"], float(exit_price), reason)
-                    elif position_strategy.name == PremarketRegressionStrategy.name:
-                        closed = None
-                    elif position_strategy is strategy:
-                        closed = self._manage_open_position(position, row)
-                    else:
-                        closed = None
+                    closed = self._manage_open_position(position, row)
                     if closed is not None:
                         equity += closed.pnl
                         daily_loss += min(closed.pnl, 0.0)
@@ -1283,8 +1021,8 @@ class BacktestEngine:
                     continue
                 if abs(daily_loss) >= equity * self.config.max_daily_loss:
                     continue
-                symbol_positions = [position for position in positions if position.symbol == symbol and position.strategy == strategy_name]
-                if len(symbol_positions) >= strategy.max_concurrent_entries(self.config):
+                symbol_positions = [position for position in positions if position.symbol == symbol and position.strategy == self.config.strategy]
+                if len(symbol_positions) >= 1:
                     continue
 
                 signal = strategy.generate_signal(symbol, history, self.config, self.config.spread_bps)
@@ -1293,8 +1031,7 @@ class BacktestEngine:
 
                 reserved_capital = sum(position.open_qty * position.entry_price for position in positions)
                 available_capital = max(equity - reserved_capital, 0.0)
-                custom_qty = strategy.position_size(available_capital, signal, self.config)
-                qty_basis = custom_qty if custom_qty is not None else position_size_from_risk(
+                qty_basis = position_size_from_risk(
                     available_capital,
                     signal.entry,
                     signal.stop,
@@ -1314,19 +1051,19 @@ class BacktestEngine:
                 spread_cost, entry_slippage = estimate_costs(signal.entry, qty, self.config.spread_bps, self.config.slippage_bps)
                 positions.append(
                     BacktestPosition(
-                    symbol=symbol,
-                    strategy=strategy_name,
-                    side=signal.side,
-                    entry_time=row["timestamp"],
-                    entry_price=entry_fill,
-                    signal_price=signal.entry,
-                    stop_price=signal.stop,
-                    initial_stop_price=signal.stop,
-                    qty=qty,
-                    open_qty=qty,
-                    initial_risk_per_unit=abs(entry_fill - signal.stop),
-                    estimated_spread_cost=spread_cost,
-                    estimated_entry_slippage=entry_slippage,
+                        symbol=symbol,
+                        strategy=self.config.strategy,
+                        side=signal.side,
+                        entry_time=row["timestamp"],
+                        entry_price=entry_fill,
+                        signal_price=signal.entry,
+                        stop_price=signal.stop,
+                        initial_stop_price=signal.stop,
+                        qty=qty,
+                        open_qty=qty,
+                        initial_risk_per_unit=abs(entry_fill - signal.stop),
+                        estimated_spread_cost=spread_cost,
+                        estimated_entry_slippage=entry_slippage,
                     )
                 )
                 trades_today += 1
@@ -1358,7 +1095,7 @@ class BacktestEngine:
             else 0.0
         )
         return {
-            "strategy": strategy_name,
+            "strategy": self.config.strategy,
             "ending_equity": round(equity, 2),
             "total_return": round(total_return * 100, 2),
             "win_rate": round(win_rate * 100, 2),
@@ -1477,13 +1214,9 @@ class BacktestEngine:
         )
 
 
-def compare_strategies(config: Config, strategy_names: list[str]) -> pd.DataFrame:
-    results: list[dict[str, Any]] = []
-    for strategy_name in strategy_names:
-        isolated = replace(config, strategy=strategy_name)
-        journal = Journal(f"{Path(config.journal_path).stem}_{strategy_name}.csv")
-        engine = BacktestEngine(isolated, journal)
-        results.append(engine.run(strategy_name))
+def compare_strategies(config: Config) -> pd.DataFrame:
+    journal = Journal(f"{Path(config.journal_path).stem}_momentum.csv")
+    results = [BacktestEngine(config, journal).run()]
     frame = pd.DataFrame(results)
     if not frame.empty:
         frame = frame.sort_values(["total_return", "win_rate", "average_r"], ascending=[False, False, False]).reset_index(drop=True)
@@ -1926,7 +1659,7 @@ class StreamExecutionEngine:
             return
         if symbol not in self.broker_state.positions and len(self.broker_state.positions) >= self.config.max_open_positions:
             return
-        if self._active_entry_layers(symbol, signal.strategy) >= self.strategy.max_concurrent_entries(self.config):
+        if self._active_entry_layers(symbol, signal.strategy) >= 1:
             return
         if self.state_machine.has_open_order(symbol, signal.side, "entry"):
             return
@@ -1935,8 +1668,7 @@ class StreamExecutionEngine:
             return
         price_reference = float(quote["mid"] or signal.entry)
         capital_base = self._capital_base()
-        custom_qty = self.strategy.position_size(capital_base, signal, self.config)
-        qty_basis = custom_qty if custom_qty is not None else position_size_from_risk(
+        qty_basis = position_size_from_risk(
             capital_base,
             price_reference,
             signal.stop,
@@ -1945,7 +1677,7 @@ class StreamExecutionEngine:
         qty = normalize_qty(self.config.asset_class, qty_basis)
         if qty <= 0:
             return
-        if not self._entry_risk_checks(symbol, price_reference, qty, quote, signal.strategy):
+        if not self._entry_risk_checks(symbol, price_reference, qty, quote):
             return
         client_order_id = deterministic_client_order_id(execution_mode(self.config.mode), signal.strategy, symbol, signal.side, "entry", signal.bar_time)
         if client_order_id in self.state_machine.orders and self.state_machine.orders[client_order_id].status in {"new", "accepted", "partially_filled", "filled"}:
@@ -2022,14 +1754,6 @@ class StreamExecutionEngine:
             return
         history = self.history[symbol]
         row = history.iloc[-1]
-        position_strategy = STRATEGIES.get(position.strategy, self.strategy)
-        custom_exit = position_strategy.exit_signal(position, history, self.config)
-        if custom_exit is not None:
-            reason, _ = custom_exit
-            await self._submit_exit(symbol, position, position.qty, reason, row["timestamp"])
-            return
-        if position_strategy.name == PremarketRegressionStrategy.name:
-            return
         if position.side == "buy":
             partial_target = position.avg_entry_price + position.initial_risk_per_unit * self.config.partial_take_profit_r
             final_target = position.avg_entry_price + position.initial_risk_per_unit * self.config.final_take_profit_r
@@ -2136,7 +1860,6 @@ class StreamExecutionEngine:
         if fill_delta <= 0:
             return
         if order.entry_exit == "entry":
-            first_fill_for_order = order.last_processed_fill_qty <= 0
             side = "buy" if order.side == "buy" else "sell"
             existing = self.broker_state.positions.get(order.symbol)
             if existing is None:
@@ -2149,7 +1872,6 @@ class StreamExecutionEngine:
                     stop_price=order.stop_price,
                     initial_risk_per_unit=abs(order.avg_fill_price - order.stop_price),
                     entry_time=order.last_update_time,
-                    entry_count=1,
                     last_fill_time=order.last_update_time,
                 )
             else:
@@ -2166,8 +1888,6 @@ class StreamExecutionEngine:
                 existing.initial_risk_per_unit = abs(existing.avg_entry_price - existing.stop_price) if existing.stop_price > 0 else existing.initial_risk_per_unit
                 existing.last_fill_time = order.last_update_time
                 existing.strategy = order.strategy
-                if first_fill_for_order:
-                    existing.entry_count += 1
         else:
             position = self.broker_state.positions.get(order.symbol)
             if position is None:
@@ -2235,10 +1955,6 @@ class StreamExecutionEngine:
             client_order_id = raw.get("client_order_id") or raw.get("id", "")
             symbol = raw.get("symbol", "")
             normalized_id = client_order_id.replace("_", "").lower()
-            strategy_guess = next(
-                (s for s in STRATEGIES if s.replace("_", "")[:12].lower() in normalized_id),
-                self.config.strategy,
-            )
             persisted_order = local_state.get("orders", {}).get(client_order_id, {})
             stop_price = float(persisted_order.get("stop_price") or 0.0)
             entry_exit = persisted_order.get("entry_exit") or ("exit" if "exit" in normalized_id else "entry")
@@ -2246,7 +1962,7 @@ class StreamExecutionEngine:
             order = LiveOrder(
                 client_order_id=client_order_id,
                 symbol=symbol,
-                strategy=str(persisted_order.get("strategy") or strategy_guess),
+                strategy=str(persisted_order.get("strategy") or self.config.strategy),
                 side=raw.get("side", ""),
                 intended_qty=float(raw.get("qty") or 0.0),
                 intended_price=intended_price,
@@ -2292,7 +2008,6 @@ class StreamExecutionEngine:
                 stop_price=stop_price,
                 initial_risk_per_unit=initial_risk,
                 entry_time=utc_timestamp(persisted_position.get("entry_time")) if persisted_position.get("entry_time") else utc_now(),
-                entry_count=int(persisted_position.get("entry_count") or 1),
                 partial_taken=bool(persisted_position.get("partial_taken", False)),
                 realized_pnl=float(persisted_position.get("realized_pnl") or 0.0),
                 recovery_only=recovery_only,
@@ -2457,7 +2172,7 @@ class StreamExecutionEngine:
             return None
         return None
 
-    def _entry_risk_checks(self, symbol: str, price_reference: float, qty: float, quote: dict[str, Any], strategy_name: str) -> bool:
+    def _entry_risk_checks(self, symbol: str, price_reference: float, qty: float, quote: dict[str, Any]) -> bool:
         if self.broker_state.uncertain or self.broker_state.kill_switch_active:
             return False
         spread_bps = float(quote.get("spread_bps") or 0.0)
@@ -2470,23 +2185,15 @@ class StreamExecutionEngine:
         current_gross_exposure = self._gross_exposure()
         proposed_notional = price_reference * qty
         live_capital = self._capital_base()
-        position_limit = self.config.max_position_notional
-        symbol_limit = self.config.max_symbol_exposure
-        gross_limit = self.config.max_gross_exposure
-        if strategy_name == PremarketRegressionStrategy.name:
-            allocation_cap = live_capital * max(min(self.config.premarket_regression_allocation_fraction, 1.0), 0.0)
-            position_limit = max(position_limit, allocation_cap)
-            symbol_limit = max(symbol_limit, allocation_cap)
-            gross_limit = max(gross_limit, allocation_cap)
-        if current_symbol_exposure >= symbol_limit:
+        if current_symbol_exposure >= self.config.max_symbol_exposure:
             return False
-        if current_gross_exposure >= gross_limit:
+        if current_gross_exposure >= self.config.max_gross_exposure:
             return False
-        if proposed_notional > position_limit:
+        if proposed_notional > self.config.max_position_notional:
             return False
-        if current_symbol_exposure + proposed_notional > symbol_limit:
+        if current_symbol_exposure + proposed_notional > self.config.max_symbol_exposure:
             return False
-        if current_gross_exposure + proposed_notional > gross_limit:
+        if current_gross_exposure + proposed_notional > self.config.max_gross_exposure:
             return False
         if proposed_notional > self.broker_state.account_cash > 0:
             return False
@@ -2498,7 +2205,7 @@ class StreamExecutionEngine:
         layers = 0
         position = self.broker_state.positions.get(symbol)
         if position is not None and position.strategy == strategy_name:
-            layers += max(position.entry_count, 1)
+            layers += 1
         for order in self.state_machine.orders.values():
             if order.symbol != symbol or order.strategy != strategy_name or order.entry_exit != "entry":
                 continue
@@ -2703,7 +2410,6 @@ class StreamExecutionEngine:
                 "stop_price": position.stop_price,
                 "initial_risk_per_unit": position.initial_risk_per_unit,
                 "entry_time": position.entry_time.isoformat(),
-                "entry_count": position.entry_count,
                 "partial_taken": position.partial_taken,
                 "realized_pnl": position.realized_pnl,
                 "recovery_only": position.recovery_only,
@@ -2853,12 +2559,12 @@ class TradingBot:
         if show_plan:
             print(PLAN_TEXT.strip())
         if compare:
-            frame = compare_strategies(self.config, self.config.compare_strategies)
+            frame = compare_strategies(self.config)
             print_strategy_comparison(frame)
             return
         if execution_mode(self.config.mode) == "backtest":
             journal = Journal(self.config.journal_path)
-            result = BacktestEngine(self.config, journal).run(self.config.strategy)
+            result = BacktestEngine(self.config, journal).run()
             print_backtest_summary(result)
             return
         journal = Journal(self.config.journal_path)
@@ -2872,8 +2578,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lightweight trading bot for small accounts.")
     parser.add_argument("--mode", choices=["backtest", "paper", "live", "scheduled_paper", "scheduled_live"], default="backtest")
     parser.add_argument("--asset-class", choices=["equity", "crypto"], default=None)
-    parser.add_argument("--strategy", choices=sorted(STRATEGIES.keys()), default="momentum")
-    parser.add_argument("--compare", action="store_true", help="Run comparison across configured strategies.")
+    parser.add_argument("--compare", action="store_true", help="Run a momentum backtest summary and write strategy_comparison.csv.")
     parser.add_argument("--symbols", nargs="+", help="Override watchlist symbols.")
     parser.add_argument("--capital", type=float, help="Override starting capital.")
     parser.add_argument("--timeframe", default=None, help="Override timeframe such as 5Min or 15Min.")
@@ -2885,7 +2590,6 @@ def main() -> None:
     args = parse_args()
     config = Config.from_env()
     config.mode = args.mode
-    config.strategy = args.strategy
     if args.asset_class:
         config.asset_class = args.asset_class
     if args.symbols:
@@ -2894,18 +2598,6 @@ def main() -> None:
         config.starting_capital = args.capital
     if args.timeframe:
         config.timeframe = args.timeframe
-    elif config.strategy == BollingerMeanReversionLongStrategy.name and config.timeframe == "15Min":
-        config.timeframe = "1Hour"
-    if (
-        config.strategy == BollingerMeanReversionLongStrategy.name
-        and not args.symbols
-        and config.symbols == ["AAPL", "MSFT", "AMD"]
-    ):
-        config.symbols = ["XAUUSD"]
-    if config.strategy == PremarketRegressionStrategy.name:
-        config.symbols = [config.premarket_regression_symbol]
-    if config.strategy not in STRATEGIES:
-        raise ValueError(f"Unknown strategy: {config.strategy}")
     TradingBot(config).run(compare=args.compare, show_plan=args.show_plan)
 
 
