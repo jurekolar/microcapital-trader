@@ -878,6 +878,7 @@ class LivePosition:
     realized_pnl: float = 0.0
     recovery_only: bool = False
     last_fill_time: pd.Timestamp = field(default_factory=utc_now)
+    available_qty: float | None = None
 
 
 class OrderStateMachine:
@@ -1844,6 +1845,10 @@ class StreamExecutionEngine:
             return
         if self.broker_state.uncertain:
             self._safe_reconcile()
+        available_qty = self._available_exit_qty(symbol)
+        qty = normalize_qty(self.config.asset_class, min(qty, available_qty))
+        if qty <= 0:
+            return
         client_order_id = deterministic_client_order_id(
             execution_mode(self.config.mode),
             position.strategy,
@@ -1932,6 +1937,7 @@ class StreamExecutionEngine:
                     initial_risk_per_unit=abs(order.avg_fill_price - order.stop_price),
                     entry_time=order.last_update_time,
                     last_fill_time=order.last_update_time,
+                    available_qty=fill_delta,
                 )
             else:
                 total_qty = normalize_qty(self.config.asset_class, existing.qty + fill_delta)
@@ -1944,6 +1950,7 @@ class StreamExecutionEngine:
                             (existing.stop_price * existing.qty) + (order.stop_price * fill_delta)
                         ) / total_qty
                 existing.qty = total_qty
+                existing.available_qty = total_qty
                 existing.initial_risk_per_unit = abs(existing.avg_entry_price - existing.stop_price) if existing.stop_price > 0 else existing.initial_risk_per_unit
                 existing.last_fill_time = order.last_update_time
                 existing.strategy = order.strategy
@@ -1960,6 +1967,10 @@ class StreamExecutionEngine:
                 del self.broker_state.positions[order.symbol]
             else:
                 position.qty = remaining
+                if position.available_qty is not None:
+                    position.available_qty = normalize_qty(self.config.asset_class, max(position.available_qty - fill_delta, 0.0))
+                else:
+                    position.available_qty = remaining
                 position.last_fill_time = order.last_update_time
             if "partial" in order.client_order_id:
                 position.partial_taken = True
@@ -2057,6 +2068,8 @@ class StreamExecutionEngine:
                 continue
             side = "buy" if float(raw.get("qty") or 0.0) > 0 else "sell"
             symbol = raw["symbol"]
+            available_raw = raw.get("qty_available")
+            available_qty = abs(float(available_raw if available_raw not in (None, "") else qty))
             persisted_position = local_state.get("positions", {}).get(symbol, {})
             avg_entry_price = float(raw.get("avg_entry_price") or 0.0)
             stop_price, initial_risk, strategy_name, entry_time = self._position_risk_metadata(
@@ -2078,6 +2091,7 @@ class StreamExecutionEngine:
                 partial_taken=bool(persisted_position.get("partial_taken", False)),
                 realized_pnl=float(persisted_position.get("realized_pnl") or 0.0),
                 recovery_only=recovery_only,
+                available_qty=normalize_qty(self.config.asset_class, available_qty),
             )
             daily_unrealized_pnl += float(raw.get("unrealized_pl") or 0.0)
         self.broker_state.positions = rebuilt_positions
@@ -2150,21 +2164,16 @@ class StreamExecutionEngine:
         while attempts <= self.config.max_submit_retries:
             try:
                 response = submitter()
-                tracked = self.state_machine.apply_update(
-                    client_order_id=order.client_order_id,
-                    status=response.get("status", "accepted"),
-                    filled_qty=float(response.get("filled_qty") or 0.0),
-                    avg_fill_price=float(response.get("filled_avg_price") or 0.0),
-                    broker_order_id=response.get("id", ""),
-                    timestamp=utc_now(),
-                )
-                self._rebuild_position_from_fills(tracked)
-                self._persist_local_state()
+                self._apply_broker_order_snapshot(order, response)
                 return
             except requests.HTTPError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
                 formatted_error = format_http_error(exc)
                 if 400 <= status_code < 500 and status_code != 429:
+                    existing = self._lookup_broker_order(order.client_order_id)
+                    if existing is not None:
+                        self._apply_broker_order_snapshot(order, existing, rejection_reason=formatted_error)
+                        return
                     self.state_machine.apply_update(
                         client_order_id=order.client_order_id,
                         status="rejected",
@@ -2189,16 +2198,7 @@ class StreamExecutionEngine:
                 self._safe_reconcile()
                 existing = self._lookup_broker_order(order.client_order_id)
                 if existing is not None:
-                    tracked = self.state_machine.apply_update(
-                        client_order_id=order.client_order_id,
-                        status=str(existing.get("status", "accepted")).lower(),
-                        filled_qty=float(existing.get("filled_qty") or 0.0),
-                        avg_fill_price=float(existing.get("filled_avg_price") or 0.0),
-                        broker_order_id=existing.get("id", ""),
-                        timestamp=utc_now(),
-                    )
-                    self._rebuild_position_from_fills(tracked)
-                    self._persist_local_state()
+                    self._apply_broker_order_snapshot(order, existing)
                     return
                 attempts += 1
             except Exception as exc:
@@ -2230,6 +2230,21 @@ class StreamExecutionEngine:
             timestamp=utc_now(),
         )
         self._persist_local_state()
+
+    def _apply_broker_order_snapshot(self, order: LiveOrder, snapshot: dict[str, Any], rejection_reason: str = "") -> LiveOrder:
+        status = str(snapshot.get("status", "accepted")).lower()
+        tracked = self.state_machine.apply_update(
+            client_order_id=order.client_order_id,
+            status=status,
+            filled_qty=float(snapshot.get("filled_qty") or 0.0),
+            avg_fill_price=float(snapshot.get("filled_avg_price") or 0.0),
+            broker_order_id=snapshot.get("id", ""),
+            rejection_reason=rejection_reason if status == "rejected" else "",
+            timestamp=utc_now(),
+        )
+        self._rebuild_position_from_fills(tracked)
+        self._persist_local_state()
+        return tracked
 
     def _lookup_broker_order(self, client_order_id: str) -> dict[str, Any] | None:
         try:
@@ -2293,7 +2308,9 @@ class StreamExecutionEngine:
         if position is None:
             return 0.0
         reserved = self.broker_state.reserved_exit_qty_by_symbol.get(symbol, 0.0)
-        return normalize_qty(self.config.asset_class, max(position.qty - reserved, 0.0))
+        local_available = max(position.qty - reserved, 0.0)
+        broker_available = position.available_qty if position.available_qty is not None else position.qty
+        return normalize_qty(self.config.asset_class, min(local_available, max(broker_available, 0.0)))
 
     def _capital_base(self) -> float:
         if execution_mode(self.config.mode) in {"paper", "live"}:
@@ -2388,6 +2405,7 @@ class StreamExecutionEngine:
     def _safe_reconcile(self) -> None:
         try:
             self.reconcile_state()
+            self._persist_local_state()
         except Exception as exc:
             print(f"Reconciliation failed: {exc}")
 
@@ -2515,6 +2533,7 @@ class StreamExecutionEngine:
                 "partial_taken": position.partial_taken,
                 "realized_pnl": position.realized_pnl,
                 "recovery_only": position.recovery_only,
+                "available_qty": position.available_qty,
             }
         payload = {
             "session_day": str(self.current_session_day),
