@@ -3105,3 +3105,6 @@ timestamp,symbol,strategy,side,mode,event,entry_exit,stop,size,signal_price,inte
 2026-05-04T17:15:00+00:00,QCOM,momentum,sell,backtest,target_or_structure,round_trip,180.921175,10.7655,168.815,168.815,168.86752,0.726919,1.453838,2.180757,-1.29,-0.01,open,,,10.7655,0.0,,entry=168.747474
 2026-05-05T15:30:00+00:00,QCOM,momentum,buy,backtest,target_or_structure,round_trip,170.348063,14.8712,175.19,175.19,184.306248,0.795252,1.590505,2.385757,103.79,1.42,open,,,14.8712,0.0,,entry=175.260076
 2026-05-05T19:45:00+00:00,QCOM,momentum,buy,backtest,end_of_data,round_trip,184.5375,14.5228,186.54,186.54,186.415404,1.083488,2.166976,3.250464,-2.89,-0.1,close,,,14.5228,0.0,,entry=186.614616
+2026-05-06T13:46:00.562477+00:00,NOW,momentum,sell,paper,new,entry,91.84905,11.3045,88.91,88.46,,,0.45218,,,,open,mc-p-momentum-entry-NOW-8432a37e22bb69bf36b9,new,0.0,11.3045,,intent_registered
+2026-05-06T13:46:01.597041+00:00,NOW,momentum,sell,paper,rejected,entry,91.84905,11.3045,88.91,88.46,,,0.45218,,,,open,mc-p-momentum-entry-NOW-8432a37e22bb69bf36b9,rejected,0.0,11.3045,403 Client Error: Forbidden for url: https://paper-api.alpaca.markets/v2/orders,
+2026-05-06T14:46:00.230777+00:00,TQQQ,momentum,buy,paper,new,entry,69.321263,14.2379,70.15,70.235,,,0.142379,,,,open,mc-p-momentum-entry-TQQQ-9c48fce78889de107593,new,0.0,14.2379,,intent_registered
