@@ -1,12 +1,16 @@
+import asyncio
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+import pandas as pd
 import requests
 
-from microcapital_trader import Config, Journal, StreamExecutionEngine, format_http_error
+from microcapital_trader import Config, Journal, LiveOrder, Signal, StreamExecutionEngine, format_http_error, utc_now
 
 
 class HttpErrorFormattingTests(unittest.TestCase):
@@ -54,49 +58,322 @@ class EntryRiskCheckTests(unittest.TestCase):
         engine.broker_state.shorting_enabled = True
         return engine
 
-    def test_short_entry_skips_when_account_shorting_disabled(self) -> None:
+    def test_entry_checks_allow_non_broker_safety_conditions(self) -> None:
         engine = self.make_engine()
+        engine.broker_state.uncertain = True
+        engine.broker_state.kill_switch_active = True
         engine.broker_state.shorting_enabled = False
+        engine.broker_state.buying_power = 0.0
+        engine.broker_state.cooldowns["NOW"] = utc_now() + pd.Timedelta(minutes=30)
+        engine.broker_state.recovery_only_symbols.add("NOW")
+        engine.broker_state.reserved_notional_by_symbol["NOW"] = 50_000.0
+        engine.last_market_data_time = utc_now() - pd.Timedelta(hours=1)
 
         with redirect_stdout(io.StringIO()):
             allowed = engine._entry_risk_checks(
                 "NOW",
                 "sell",
                 100.0,
-                5.0,
-                {"ask": 101.0, "spread_bps": 1.0, "timestamp": None},
+                5_000.0,
+                {
+                    "ask": 101.0,
+                    "spread_bps": 10_000.0,
+                    "timestamp": utc_now() - pd.Timedelta(hours=1),
+                },
             )
-
-        self.assertFalse(allowed)
-
-    def test_short_entry_skips_when_short_buying_power_is_insufficient(self) -> None:
-        engine = self.make_engine()
-        engine.broker_state.buying_power = 520.0
-
-        with redirect_stdout(io.StringIO()):
-            allowed = engine._entry_risk_checks(
-                "NOW",
-                "sell",
-                100.0,
-                5.0,
-                {"ask": 101.0, "spread_bps": 1.0, "timestamp": None},
-            )
-
-        self.assertFalse(allowed)
-
-    def test_long_entry_uses_buying_power_not_shorting_flag(self) -> None:
-        engine = self.make_engine()
-        engine.broker_state.shorting_enabled = False
-
-        allowed = engine._entry_risk_checks(
-            "TQQQ",
-            "buy",
-            100.0,
-            5.0,
-            {"ask": 101.0, "spread_bps": 1.0, "timestamp": None},
-        )
 
         self.assertTrue(allowed)
+        self.assertTrue(engine._can_trade_symbol("NOW"))
+
+    def test_entry_checks_allow_missing_quote_payload(self) -> None:
+        engine = self.make_engine()
+
+        allowed = engine._entry_risk_checks("NOW", "sell", 100.0, 5.0, {})
+
+        self.assertTrue(allowed)
+
+    def test_missing_stream_quote_falls_back_to_signal_price(self) -> None:
+        engine = self.make_engine()
+
+        quote = engine._stream_quote_snapshot_or_fallback("TQQQ", 70.15, pd.Timestamp("2026-05-06T14:45:00Z"))
+
+        self.assertEqual(70.15, quote["mid"])
+        self.assertEqual(0.0, quote["spread_bps"])
+
+
+class EntrySubmissionRelaxationTests(unittest.TestCase):
+    class StaticStrategy:
+        def generate_signal(self, symbol: str, history: pd.DataFrame, config: Config, estimated_spread_bps: float) -> Signal:
+            return Signal(
+                strategy="momentum",
+                symbol=symbol,
+                side="buy",
+                entry=100.0,
+                stop=95.0,
+                target_1=105.0,
+                target_2=110.0,
+                reason="test_signal",
+                bar_time=history.iloc[-1]["timestamp"],
+            )
+
+    class CapturingExecutor:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[Signal, float, str]] = []
+
+        def submit_entry_order(self, signal: Signal, qty: float, client_order_id: str) -> dict[str, str]:
+            self.submitted.append((signal, qty, client_order_id))
+            return {"status": "accepted", "filled_qty": "0", "filled_avg_price": "0", "id": "broker-1"}
+
+    def make_engine(self) -> StreamExecutionEngine:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="paper",
+            asset_class="equity",
+            symbols=["AAPL"],
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+        )
+        engine = StreamExecutionEngine(config, Journal(config.journal_path))
+        engine.strategy = self.StaticStrategy()
+        engine.executor = self.CapturingExecutor()
+        engine.broker_state.uncertain = False
+        engine.broker_state.kill_switch_active = True
+        engine.broker_state.buying_power = 0.0
+        engine.broker_state.shorting_enabled = False
+        engine.broker_state.cooldowns["AAPL"] = utc_now() + pd.Timedelta(minutes=30)
+        engine.broker_state.recovery_only_symbols.add("AAPL")
+        engine.history["AAPL"] = pd.DataFrame(
+            [
+                {
+                    "timestamp": pd.Timestamp("2026-05-06T14:30:00Z"),
+                    "open": 99.0,
+                    "high": 100.0,
+                    "low": 98.0,
+                    "close": 99.5,
+                    "volume": 1000,
+                    "symbol": "AAPL",
+                }
+            ]
+        )
+        return engine
+
+    def test_closed_bar_submits_with_missing_quote_and_relaxed_local_flags(self) -> None:
+        engine = self.make_engine()
+        bar = pd.Series(
+            {
+                "timestamp": pd.Timestamp("2026-05-06T14:45:00Z"),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.0,
+                "volume": 1500,
+            }
+        )
+
+        asyncio.run(engine._on_closed_bar("AAPL", bar))
+
+        executor = engine.executor
+        self.assertEqual(1, len(executor.submitted))
+        order = next(iter(engine.state_machine.orders.values()))
+        self.assertEqual(100.0, order.intended_price)
+        self.assertEqual(0.0, order.expected_spread_bps)
+
+
+class SubmitFillReconciliationTests(unittest.TestCase):
+    def make_engine(self) -> StreamExecutionEngine:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="paper",
+            asset_class="equity",
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+            alpaca_api_key="key",
+            alpaca_secret_key="secret",
+        )
+        engine = StreamExecutionEngine(config, Journal(config.journal_path))
+        return engine
+
+    def make_order(self, qty: float = 5.0) -> LiveOrder:
+        return LiveOrder(
+            client_order_id="mc-p-momentum-entry-AAPL-test",
+            symbol="AAPL",
+            strategy="momentum",
+            side="buy",
+            intended_qty=qty,
+            intended_price=100.0,
+            signal_price=100.0,
+            stop_price=95.0,
+            entry_exit="entry",
+            bar_time=pd.Timestamp("2026-05-06T14:45:00Z"),
+        )
+
+    def test_immediate_filled_submit_rebuilds_position(self) -> None:
+        engine = self.make_engine()
+        order = self.make_order()
+        engine.state_machine.register_intent(order)
+
+        asyncio.run(
+            engine._submit_order_with_retry(
+                order,
+                lambda: {"status": "filled", "filled_qty": "5", "filled_avg_price": "101", "id": "broker-1"},
+            )
+        )
+
+        position = engine.broker_state.positions["AAPL"]
+        self.assertEqual(5.0, position.qty)
+        self.assertEqual(101.0, position.avg_entry_price)
+        self.assertEqual(95.0, position.stop_price)
+        self.assertEqual(6.0, position.initial_risk_per_unit)
+        self.assertEqual(5.0, engine.state_machine.orders[order.client_order_id].last_processed_fill_qty)
+
+    def test_immediate_partially_filled_submit_rebuilds_position_once(self) -> None:
+        engine = self.make_engine()
+        order = self.make_order()
+        engine.state_machine.register_intent(order)
+
+        asyncio.run(
+            engine._submit_order_with_retry(
+                order,
+                lambda: {"status": "partially_filled", "filled_qty": "2", "filled_avg_price": "101", "id": "broker-1"},
+            )
+        )
+        tracked = engine.state_machine.apply_update(
+            order.client_order_id,
+            "partially_filled",
+            2.0,
+            101.0,
+            broker_order_id="broker-1",
+        )
+        engine._rebuild_position_from_fills(tracked)
+
+        self.assertEqual(2.0, engine.broker_state.positions["AAPL"].qty)
+        self.assertEqual(2.0, engine.state_machine.orders[order.client_order_id].last_processed_fill_qty)
+
+
+class ReconcileStateTests(unittest.TestCase):
+    class FakeResponse:
+        def __init__(self, payload: object):
+            self.payload = payload
+
+        def json(self) -> object:
+            return self.payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def make_engine(self) -> StreamExecutionEngine:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="paper",
+            asset_class="equity",
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+            alpaca_api_key="key",
+            alpaca_secret_key="secret",
+        )
+        return StreamExecutionEngine(config, Journal(config.journal_path))
+
+    def fake_get(self, positions: list[dict[str, str]]):
+        def _fake_get(url: str, **kwargs: object) -> ReconcileStateTests.FakeResponse:
+            if url.endswith("/v2/orders"):
+                return self.FakeResponse([])
+            if url.endswith("/v2/positions"):
+                return self.FakeResponse(positions)
+            if url.endswith("/v2/account"):
+                return self.FakeResponse(
+                    {
+                        "equity": "10000",
+                        "cash": "10000",
+                        "buying_power": "0",
+                        "shorting_enabled": False,
+                    }
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        return _fake_get
+
+    def write_state(self, engine: StreamExecutionEngine, payload: dict[str, object]) -> None:
+        engine.state_path.write_text(json.dumps(payload))
+
+    def test_reconcile_preserves_known_order_and_recovers_position_risk(self) -> None:
+        engine = self.make_engine()
+        client_order_id = "mc-p-momentum-entry-AAPL-test"
+        self.write_state(
+            engine,
+            {
+                "orders": {
+                    client_order_id: {
+                        "client_order_id": client_order_id,
+                        "symbol": "AAPL",
+                        "strategy": "momentum",
+                        "side": "buy",
+                        "intended_qty": 5.0,
+                        "intended_price": 100.0,
+                        "signal_price": 100.0,
+                        "stop_price": 95.0,
+                        "status": "filled",
+                        "filled_qty": 5.0,
+                        "last_processed_fill_qty": 5.0,
+                        "avg_fill_price": 101.0,
+                        "last_update_time": "2026-05-06T14:46:00+00:00",
+                        "entry_exit": "entry",
+                    }
+                },
+                "positions": {},
+            },
+        )
+
+        with patch(
+            "microcapital_trader.requests.get",
+            side_effect=self.fake_get([{"symbol": "AAPL", "qty": "5", "avg_entry_price": "101", "unrealized_pl": "0"}]),
+        ):
+            engine.reconcile_state()
+
+        self.assertIn(client_order_id, engine.state_machine.orders)
+        position = engine.broker_state.positions["AAPL"]
+        self.assertFalse(position.recovery_only)
+        self.assertEqual(95.0, position.stop_price)
+        self.assertEqual(6.0, position.initial_risk_per_unit)
+
+    def test_reconcile_keeps_missing_risk_position_unmanaged_but_not_symbol_blocked(self) -> None:
+        engine = self.make_engine()
+        self.write_state(engine, {"orders": {}, "positions": {}, "recovery_only": ["AAPL"]})
+
+        with patch(
+            "microcapital_trader.requests.get",
+            side_effect=self.fake_get([{"symbol": "AAPL", "qty": "5", "avg_entry_price": "101", "unrealized_pl": "0"}]),
+        ):
+            engine.reconcile_state()
+
+        position = engine.broker_state.positions["AAPL"]
+        self.assertTrue(position.recovery_only)
+        self.assertNotIn("AAPL", engine.broker_state.recovery_only_symbols)
+        self.assertTrue(engine._can_trade_symbol("AAPL"))
+
+
+class LiveConfigValidationTests(unittest.TestCase):
+    def test_paper_mode_rejects_live_endpoint(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="paper",
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+            alpaca_api_key="key",
+            alpaca_secret_key="secret",
+            alpaca_base_url="https://api.alpaca.markets",
+        )
+        engine = StreamExecutionEngine(config, Journal(config.journal_path))
+
+        with self.assertRaisesRegex(ValueError, "paper mode requires"):
+            engine._validate_live_config()
 
 
 if __name__ == "__main__":

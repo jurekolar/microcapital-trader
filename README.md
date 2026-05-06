@@ -292,10 +292,13 @@ Available flags:
 - `scheduled_paper` and `scheduled_live` also require Alpaca credentials
 - `live` requires `ALLOW_LIVE=true`
 - `scheduled_live` also requires `ALLOW_LIVE=true`
+- paper mode requires `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
+- live mode requires `ALPACA_BASE_URL=https://api.alpaca.markets`
 - position sizing is capped by available account equity
 - the current execution path submits market orders only
-- short logic exists in the backtest and signal engine, but paper/live short entries require `ALLOW_SHORT=true`, Alpaca `shorting_enabled=true`, and enough buying power for Alpaca's short-sell buying-power check
-- unsupported paper/live short entries are skipped locally before order submission; broker-side order rejections include Alpaca HTTP status, request ID, and response body in `rejection_reason`
+- short logic exists in the backtest and signal engine and still requires `ALLOW_SHORT=true` to generate short signals
+- paper/live no longer skip entries locally for spread, stale quotes, cooldowns, exposure caps, recovery flags, account shorting metadata, or buying-power estimates; Alpaca accepts or rejects submitted market orders
+- broker-side order rejections include Alpaca HTTP status, request ID, and response body in `rejection_reason`
 
 ## Limitations
 

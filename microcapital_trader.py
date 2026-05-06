@@ -431,6 +431,10 @@ def deterministic_client_order_id(
     return f"mc-{mode[:1]}-{safe_strategy}-{safe_action}-{safe_symbol}-{digest}"
 
 
+def normalize_base_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
 class Journal:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -904,11 +908,10 @@ class OrderStateMachine:
             raise ValueError(f"Unsupported order status: {status}")
         if status != order.status and status not in ORDER_TRANSITIONS[order.status]:
             raise ValueError(f"Invalid order transition {order.status} -> {status} for {client_order_id}")
-        previous_filled = order.filled_qty
         order.status = status
         order.filled_qty = round(max(filled_qty, 0.0), 8)
         order.remaining_qty = round(max(order.intended_qty - order.filled_qty, 0.0), 8)
-        order.last_fill_delta = round(max(order.filled_qty - previous_filled, 0.0), 8)
+        order.last_fill_delta = round(max(order.filled_qty - order.last_processed_fill_qty, 0.0), 8)
         order.avg_fill_price = avg_fill_price or order.avg_fill_price
         order.broker_order_id = broker_order_id or order.broker_order_id
         order.rejection_reason = rejection_reason
@@ -1726,18 +1729,8 @@ class StreamExecutionEngine:
         if signal is None:
             return
         if self.broker_state.uncertain:
-            self.reconcile_state()
-        if not self._can_trade_symbol(symbol):
-            return
-        if symbol not in self.broker_state.positions and len(self.broker_state.positions) >= self.config.max_open_positions:
-            return
-        if self._active_entry_layers(symbol, signal.strategy) >= 1:
-            return
-        if self.state_machine.has_open_order(symbol, signal.side, "entry"):
-            return
-        quote = self._stream_quote_snapshot(symbol)
-        if quote is None:
-            return
+            self._safe_reconcile()
+        quote = self._stream_quote_snapshot_or_fallback(symbol, signal.entry, signal.bar_time)
         price_reference = float(quote["mid"] or signal.entry)
         capital_base = self._capital_base()
         qty_basis = position_size_from_risk(
@@ -1748,8 +1741,6 @@ class StreamExecutionEngine:
         )
         qty = normalize_qty(self.config.asset_class, qty_basis)
         if qty <= 0:
-            return
-        if not self._entry_risk_checks(symbol, signal.side, price_reference, qty, quote):
             return
         client_order_id = deterministic_client_order_id(execution_mode(self.config.mode), signal.strategy, symbol, signal.side, "entry", signal.bar_time)
         if client_order_id in self.state_machine.orders and self.state_machine.orders[client_order_id].status in {"new", "accepted", "partially_filled", "filled"}:
@@ -1822,7 +1813,6 @@ class StreamExecutionEngine:
         if position is None:
             return
         if position.recovery_only or position.stop_price <= 0 or position.initial_risk_per_unit <= 0:
-            self.broker_state.recovery_only_symbols.add(symbol)
             return
         history = self.history[symbol]
         row = history.iloc[-1]
@@ -1849,13 +1839,11 @@ class StreamExecutionEngine:
         if qty <= 0:
             return
         exit_side = "sell" if position.side == "buy" else "buy"
-        available_qty = self._available_exit_qty(symbol)
-        qty = min(qty, available_qty)
         qty = normalize_qty(self.config.asset_class, qty)
-        if qty <= 0 or self.state_machine.has_open_order(symbol, exit_side, "exit"):
+        if qty <= 0:
             return
         if self.broker_state.uncertain:
-            self.reconcile_state()
+            self._safe_reconcile()
         client_order_id = deterministic_client_order_id(
             execution_mode(self.config.mode),
             position.strategy,
@@ -1866,9 +1854,10 @@ class StreamExecutionEngine:
         )
         if client_order_id in self.state_machine.orders and self.state_machine.orders[client_order_id].status in {"new", "accepted", "partially_filled", "filled"}:
             return
-        quote = self._stream_quote_snapshot(symbol)
-        if quote is None:
-            return
+        fallback_price = position.avg_entry_price
+        if symbol in self.history and not self.history[symbol].empty:
+            fallback_price = float(self.history[symbol].iloc[-1]["close"])
+        quote = self._stream_quote_snapshot_or_fallback(symbol, fallback_price, bar_time)
         intended_price = float(quote["mid"] or position.avg_entry_price)
         order = LiveOrder(
             client_order_id=client_order_id,
@@ -1923,8 +1912,6 @@ class StreamExecutionEngine:
             timestamp=pd.Timestamp.now(tz="UTC"),
         )
         self._rebuild_position_from_fills(tracked)
-        if tracked.status == "rejected":
-            self._set_symbol_cooldown(tracked.symbol, self.config.cooldown_minutes_after_rejection)
         self._persist_local_state()
 
     def _rebuild_position_from_fills(self, order: LiveOrder) -> None:
@@ -1974,15 +1961,9 @@ class StreamExecutionEngine:
             else:
                 position.qty = remaining
                 position.last_fill_time = order.last_update_time
-                if "partial" in order.client_order_id:
-                    position.partial_taken = True
-                if "stoploss" in order.client_order_id.replace("_", "").lower():
-                    self._set_symbol_cooldown(order.symbol, self.config.cooldown_minutes_after_stop)
+            if "partial" in order.client_order_id:
+                position.partial_taken = True
 
-        if order.avg_fill_price and order.intended_price > 0:
-            deviation_bps = abs(order.avg_fill_price - order.intended_price) / order.intended_price * 10_000.0
-            if deviation_bps > self.config.max_slippage_deviation_bps:
-                self.broker_state.recovery_only_symbols.add(order.symbol)
         order.last_processed_fill_qty = order.filled_qty
 
     def reconcile_state(self) -> None:
@@ -2018,8 +1999,10 @@ class StreamExecutionEngine:
         account_response.raise_for_status()
         local_state = self._read_state_file()
         account_payload = account_response.json()
+        persisted_orders = local_state.get("orders", {})
 
         rebuilt_orders: list[LiveOrder] = []
+        rebuilt_order_ids: set[str] = set()
         open_orders_by_symbol: dict[str, list[str]] = {}
         reserved_notional_by_symbol: dict[str, float] = {}
         reserved_exit_qty_by_symbol: dict[str, float] = {}
@@ -2045,8 +2028,10 @@ class StreamExecutionEngine:
                 avg_fill_price=float(raw.get("filled_avg_price") or 0.0),
                 broker_order_id=raw.get("id", ""),
                 entry_exit=entry_exit,
+                last_processed_fill_qty=float(persisted_order.get("last_processed_fill_qty") or persisted_order.get("filled_qty") or 0.0),
             )
             rebuilt_orders.append(order)
+            rebuilt_order_ids.add(client_order_id)
             open_orders_by_symbol.setdefault(symbol, []).append(client_order_id)
             if order.entry_exit == "exit":
                 reserved_exit_qty_by_symbol[symbol] = reserved_exit_qty_by_symbol.get(symbol, 0.0) + order.remaining_qty
@@ -2054,10 +2039,17 @@ class StreamExecutionEngine:
                 reserved_notional_by_symbol[symbol] = reserved_notional_by_symbol.get(symbol, 0.0) + (
                     order.remaining_qty * max(order.intended_price, 0.0)
                 )
+        for client_order_id, payload in persisted_orders.items():
+            if client_order_id in rebuilt_order_ids:
+                continue
+            order = self._order_from_state_payload(payload)
+            if order is not None:
+                rebuilt_orders.append(order)
+                rebuilt_order_ids.add(client_order_id)
         self.state_machine.replace_open_orders(rebuilt_orders)
 
         rebuilt_positions: dict[str, LivePosition] = {}
-        recovery_only_symbols = set(local_state.get("recovery_only", []))
+        recovery_only_symbols: set[str] = set()
         daily_unrealized_pnl = 0.0
         for raw in positions_response.json():
             qty = abs(float(raw.get("qty") or 0.0))
@@ -2066,20 +2058,23 @@ class StreamExecutionEngine:
             side = "buy" if float(raw.get("qty") or 0.0) > 0 else "sell"
             symbol = raw["symbol"]
             persisted_position = local_state.get("positions", {}).get(symbol, {})
-            stop_price = float(persisted_position.get("stop_price") or 0.0)
-            initial_risk = float(persisted_position.get("initial_risk_per_unit") or 0.0)
-            recovery_only = bool(persisted_position.get("recovery_only")) or stop_price <= 0 or initial_risk <= 0
-            if recovery_only:
-                recovery_only_symbols.add(symbol)
+            avg_entry_price = float(raw.get("avg_entry_price") or 0.0)
+            stop_price, initial_risk, strategy_name, entry_time = self._position_risk_metadata(
+                symbol,
+                avg_entry_price,
+                persisted_position,
+                rebuilt_orders,
+            )
+            recovery_only = stop_price <= 0 or initial_risk <= 0
             rebuilt_positions[raw["symbol"]] = LivePosition(
                 symbol=symbol,
-                strategy=str(persisted_position.get("strategy") or self.config.strategy),
+                strategy=str(strategy_name),
                 side=side,
                 qty=qty,
-                avg_entry_price=float(raw.get("avg_entry_price") or 0.0),
+                avg_entry_price=avg_entry_price,
                 stop_price=stop_price,
                 initial_risk_per_unit=initial_risk,
-                entry_time=utc_timestamp(persisted_position.get("entry_time")) if persisted_position.get("entry_time") else utc_now(),
+                entry_time=entry_time,
                 partial_taken=bool(persisted_position.get("partial_taken", False)),
                 realized_pnl=float(persisted_position.get("realized_pnl") or 0.0),
                 recovery_only=recovery_only,
@@ -2115,6 +2110,10 @@ class StreamExecutionEngine:
             raise ValueError("Live mode is blocked unless ALLOW_LIVE=true is set in the environment.")
         if not (self.config.alpaca_api_key and self.config.alpaca_secret_key):
             raise ValueError("Missing Alpaca credentials.")
+        expected_url = "https://paper-api.alpaca.markets" if trade_mode == "paper" else "https://api.alpaca.markets"
+        configured_url = normalize_base_url(self.config.alpaca_base_url)
+        if configured_url != expected_url:
+            raise ValueError(f"{trade_mode} mode requires ALPACA_BASE_URL={expected_url}. Current value: {self.config.alpaca_base_url}")
 
     async def _watch_stream_health(self) -> None:
         while True:
@@ -2151,7 +2150,7 @@ class StreamExecutionEngine:
         while attempts <= self.config.max_submit_retries:
             try:
                 response = submitter()
-                self.state_machine.apply_update(
+                tracked = self.state_machine.apply_update(
                     client_order_id=order.client_order_id,
                     status=response.get("status", "accepted"),
                     filled_qty=float(response.get("filled_qty") or 0.0),
@@ -2159,6 +2158,7 @@ class StreamExecutionEngine:
                     broker_order_id=response.get("id", ""),
                     timestamp=utc_now(),
                 )
+                self._rebuild_position_from_fills(tracked)
                 self._persist_local_state()
                 return
             except requests.HTTPError as exc:
@@ -2173,7 +2173,6 @@ class StreamExecutionEngine:
                         rejection_reason=formatted_error,
                         timestamp=utc_now(),
                     )
-                    self._set_symbol_cooldown(order.symbol, self.config.cooldown_minutes_after_rejection)
                     self._persist_local_state()
                     return
                 last_retryable_http_error = formatted_error
@@ -2190,7 +2189,7 @@ class StreamExecutionEngine:
                 self._safe_reconcile()
                 existing = self._lookup_broker_order(order.client_order_id)
                 if existing is not None:
-                    self.state_machine.apply_update(
+                    tracked = self.state_machine.apply_update(
                         client_order_id=order.client_order_id,
                         status=str(existing.get("status", "accepted")).lower(),
                         filled_qty=float(existing.get("filled_qty") or 0.0),
@@ -2198,6 +2197,7 @@ class StreamExecutionEngine:
                         broker_order_id=existing.get("id", ""),
                         timestamp=utc_now(),
                     )
+                    self._rebuild_position_from_fills(tracked)
                     self._persist_local_state()
                     return
                 attempts += 1
@@ -2229,7 +2229,6 @@ class StreamExecutionEngine:
             ),
             timestamp=utc_now(),
         )
-        self.broker_state.recovery_only_symbols.add(order.symbol)
         self._persist_local_state()
 
     def _lookup_broker_order(self, client_order_id: str) -> dict[str, Any] | None:
@@ -2253,44 +2252,6 @@ class StreamExecutionEngine:
         return None
 
     def _entry_risk_checks(self, symbol: str, side: str, price_reference: float, qty: float, quote: dict[str, Any]) -> bool:
-        if self.broker_state.uncertain or self.broker_state.kill_switch_active:
-            return False
-        spread_bps = float(quote.get("spread_bps") or 0.0)
-        if spread_bps > self.config.max_spread_bps_live:
-            return False
-        quote_timestamp = quote.get("timestamp")
-        if quote_timestamp is not None and (utc_now() - quote_timestamp).total_seconds() > self.config.market_data_stale_seconds:
-            return False
-        current_symbol_exposure = self._symbol_exposure(symbol)
-        current_gross_exposure = self._gross_exposure()
-        proposed_notional = price_reference * qty
-        live_capital = self._capital_base()
-        required_buying_power = proposed_notional
-        if side == "sell" and self.config.asset_class == "equity":
-            if not self.config.allow_short:
-                return self._skip_short_entry(symbol, "shorts_disabled", "ALLOW_SHORT=false")
-            if not self.broker_state.shorting_enabled:
-                return self._skip_short_entry(symbol, "account_shorting_disabled", "shorting_enabled=false")
-            ask = float(quote.get("ask") or 0.0)
-            short_reference = ask if ask > 0 else price_reference
-            required_buying_power = short_reference * qty * 1.03
-        if current_symbol_exposure >= self.config.max_symbol_exposure:
-            return False
-        if current_gross_exposure >= self.config.max_gross_exposure:
-            return False
-        if proposed_notional > self.config.max_position_notional:
-            return False
-        if current_symbol_exposure + proposed_notional > self.config.max_symbol_exposure:
-            return False
-        if current_gross_exposure + proposed_notional > self.config.max_gross_exposure:
-            return False
-        if required_buying_power > self.broker_state.buying_power:
-            if side == "sell" and self.config.asset_class == "equity":
-                detail = f"required_buying_power={required_buying_power:.2f} available={self.broker_state.buying_power:.2f}"
-                return self._skip_short_entry(symbol, "insufficient_short_buying_power", detail)
-            return False
-        if live_capital <= 0:
-            return False
         return True
 
     def _skip_short_entry(self, symbol: str, reason: str, detail: str) -> bool:
@@ -2351,6 +2312,19 @@ class StreamExecutionEngine:
             "timestamp": quote.timestamp,
         }
 
+    def _stream_quote_snapshot_or_fallback(self, symbol: str, fallback_price: float, fallback_time: pd.Timestamp) -> dict[str, Any]:
+        quote = self._stream_quote_snapshot(symbol)
+        if quote is not None:
+            return quote
+        fallback = max(float(fallback_price or 0.0), 0.0)
+        return {
+            "mid": fallback,
+            "bid": fallback,
+            "ask": fallback,
+            "spread_bps": 0.0,
+            "timestamp": utc_timestamp(fallback_time),
+        }
+
     def _refresh_quote_cache(self) -> bool:
         refreshed = False
         for symbol in self.config.symbols:
@@ -2390,13 +2364,6 @@ class StreamExecutionEngine:
         self.broker_state.reserved_exit_qty_by_symbol = reserved_exit_qty_by_symbol
 
     def _can_trade_symbol(self, symbol: str) -> bool:
-        if symbol in self.broker_state.recovery_only_symbols:
-            return False
-        cooldown_until = self.broker_state.cooldowns.get(symbol)
-        if cooldown_until and cooldown_until > utc_now():
-            return False
-        if self.last_market_data_time and (utc_now() - self.last_market_data_time).total_seconds() > self.config.market_data_stale_seconds:
-            return False
         return True
 
     def _has_active_orders(self) -> bool:
@@ -2432,36 +2399,71 @@ class StreamExecutionEngine:
         except Exception:
             return {}
 
+    def _order_from_state_payload(self, payload: dict[str, Any]) -> LiveOrder | None:
+        try:
+            filled_qty = float(payload.get("filled_qty") or 0.0)
+            last_processed = float(payload.get("last_processed_fill_qty", filled_qty) or 0.0)
+            return LiveOrder(
+                client_order_id=payload["client_order_id"],
+                symbol=payload["symbol"],
+                strategy=payload["strategy"],
+                side=payload["side"],
+                intended_qty=float(payload["intended_qty"]),
+                intended_price=float(payload["intended_price"]),
+                signal_price=float(payload["signal_price"]),
+                stop_price=float(payload.get("stop_price") or 0.0),
+                status=str(payload.get("status") or "new"),
+                filled_qty=filled_qty,
+                avg_fill_price=float(payload.get("avg_fill_price") or 0.0),
+                last_update_time=utc_timestamp(payload.get("last_update_time")) if payload.get("last_update_time") else utc_now(),
+                rejection_reason=str(payload.get("rejection_reason") or ""),
+                broker_order_id=str(payload.get("broker_order_id") or ""),
+                entry_exit=str(payload.get("entry_exit") or "entry"),
+                expected_spread_bps=float(payload.get("expected_spread_bps") or 0.0),
+                estimated_spread_cost=float(payload.get("estimated_spread_cost") or 0.0),
+                session_bucket=str(payload.get("session_bucket") or ""),
+                bar_time=utc_timestamp(payload.get("bar_time")) if payload.get("bar_time") else None,
+                last_processed_fill_qty=last_processed,
+            )
+        except Exception:
+            return None
+
+    def _position_risk_metadata(
+        self,
+        symbol: str,
+        avg_entry_price: float,
+        persisted_position: dict[str, Any],
+        known_orders: list[LiveOrder],
+    ) -> tuple[float, float, str, pd.Timestamp]:
+        stop_price = float(persisted_position.get("stop_price") or 0.0)
+        initial_risk = float(persisted_position.get("initial_risk_per_unit") or 0.0)
+        strategy_name = str(persisted_position.get("strategy") or self.config.strategy)
+        entry_time = utc_timestamp(persisted_position.get("entry_time")) if persisted_position.get("entry_time") else utc_now()
+        if stop_price > 0 and initial_risk <= 0 and avg_entry_price > 0:
+            initial_risk = abs(avg_entry_price - stop_price)
+        if stop_price > 0 and initial_risk > 0:
+            return stop_price, initial_risk, strategy_name, entry_time
+
+        candidates = [
+            order
+            for order in known_orders
+            if order.symbol == symbol and order.entry_exit == "entry" and order.stop_price > 0
+        ]
+        candidates.sort(key=lambda order: order.last_update_time, reverse=True)
+        for order in candidates:
+            entry_reference = order.avg_fill_price or order.intended_price or order.signal_price or avg_entry_price
+            derived_risk = abs(entry_reference - order.stop_price)
+            if derived_risk > 0:
+                return order.stop_price, derived_risk, order.strategy, order.last_update_time
+        return stop_price, initial_risk, strategy_name, entry_time
+
     def _load_local_state(self) -> None:
         state = self._read_state_file()
         loaded_orders: list[LiveOrder] = []
         for payload in state.get("orders", {}).values():
-            try:
-                loaded_orders.append(
-                    LiveOrder(
-                        client_order_id=payload["client_order_id"],
-                        symbol=payload["symbol"],
-                        strategy=payload["strategy"],
-                        side=payload["side"],
-                        intended_qty=float(payload["intended_qty"]),
-                        intended_price=float(payload["intended_price"]),
-                        signal_price=float(payload["signal_price"]),
-                        stop_price=float(payload.get("stop_price") or 0.0),
-                        status=str(payload.get("status") or "new"),
-                        filled_qty=float(payload.get("filled_qty") or 0.0),
-                        avg_fill_price=float(payload.get("avg_fill_price") or 0.0),
-                        last_update_time=utc_timestamp(payload.get("last_update_time")) if payload.get("last_update_time") else utc_now(),
-                        rejection_reason=str(payload.get("rejection_reason") or ""),
-                        broker_order_id=str(payload.get("broker_order_id") or ""),
-                        entry_exit=str(payload.get("entry_exit") or "entry"),
-                        expected_spread_bps=float(payload.get("expected_spread_bps") or 0.0),
-                        estimated_spread_cost=float(payload.get("estimated_spread_cost") or 0.0),
-                        session_bucket=str(payload.get("session_bucket") or ""),
-                        bar_time=utc_timestamp(payload.get("bar_time")) if payload.get("bar_time") else None,
-                    )
-                )
-            except Exception:
-                continue
+            order = self._order_from_state_payload(payload)
+            if order is not None:
+                loaded_orders.append(order)
         if loaded_orders:
             self.state_machine.replace_open_orders(loaded_orders)
         self._sync_order_reservations()
@@ -2488,6 +2490,7 @@ class StreamExecutionEngine:
                 "stop_price": order.stop_price,
                 "status": order.status,
                 "filled_qty": order.filled_qty,
+                "last_processed_fill_qty": order.last_processed_fill_qty,
                 "avg_fill_price": order.avg_fill_price,
                 "last_update_time": order.last_update_time.isoformat(),
                 "rejection_reason": order.rejection_reason,
