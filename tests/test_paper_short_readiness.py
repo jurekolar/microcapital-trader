@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pandas as pd
 import requests
 
-from microcapital_trader import Config, Journal, LiveOrder, Signal, StreamExecutionEngine, format_http_error, utc_now
+from microcapital_trader import Config, Journal, LiveOrder, LivePosition, Signal, StreamExecutionEngine, format_http_error, utc_now
 
 
 class HttpErrorFormattingTests(unittest.TestCase):
@@ -252,6 +252,137 @@ class SubmitFillReconciliationTests(unittest.TestCase):
 
         self.assertEqual(2.0, engine.broker_state.positions["AAPL"].qty)
         self.assertEqual(2.0, engine.state_machine.orders[order.client_order_id].last_processed_fill_qty)
+
+    def test_duplicate_client_order_rejection_recovers_filled_broker_order(self) -> None:
+        engine = self.make_engine()
+        position = LivePosition(
+            symbol="AAPL",
+            strategy="momentum",
+            side="buy",
+            qty=5.0,
+            avg_entry_price=100.0,
+            stop_price=95.0,
+            initial_risk_per_unit=5.0,
+            entry_time=pd.Timestamp("2026-05-06T14:45:00Z"),
+            available_qty=5.0,
+        )
+        engine.broker_state.positions["AAPL"] = position
+        order = LiveOrder(
+            client_order_id="mc-p-momentum-exitschedule-AAPL-test",
+            symbol="AAPL",
+            strategy="momentum",
+            side="sell",
+            intended_qty=5.0,
+            intended_price=101.0,
+            signal_price=101.0,
+            stop_price=95.0,
+            entry_exit="exit",
+        )
+        engine.state_machine.register_intent(order)
+        response = requests.Response()
+        response.status_code = 422
+        response.reason = "Unprocessable Entity"
+        response._content = b'{"message":"client_order_id must be unique"}'
+        exc = requests.HTTPError("422 Client Error", response=response)
+
+        def submitter() -> dict[str, str]:
+            raise exc
+
+        class LookupResponse:
+            def json(self) -> list[dict[str, str]]:
+                return [
+                    {
+                        "client_order_id": order.client_order_id,
+                        "status": "filled",
+                        "filled_qty": "5",
+                        "filled_avg_price": "101",
+                        "id": "broker-filled-1",
+                    }
+                ]
+
+            def raise_for_status(self) -> None:
+                return None
+
+        with patch("microcapital_trader.requests.get", return_value=LookupResponse()):
+            asyncio.run(engine._submit_order_with_retry(order, submitter))
+
+        self.assertEqual("filled", engine.state_machine.orders[order.client_order_id].status)
+        self.assertNotIn("AAPL", engine.broker_state.positions)
+
+
+class ExitSubmissionSizingTests(unittest.TestCase):
+    class CapturingExitExecutor:
+        def __init__(self) -> None:
+            self.submitted: list[tuple[LivePosition, float, str, str]] = []
+
+        def submit_exit_order(self, position: LivePosition, qty: float, client_order_id: str, reason: str) -> dict[str, str]:
+            self.submitted.append((position, qty, client_order_id, reason))
+            return {"status": "accepted", "filled_qty": "0", "filled_avg_price": "0", "id": "broker-exit-1"}
+
+    def make_engine(self) -> StreamExecutionEngine:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="paper",
+            asset_class="equity",
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+        )
+        engine = StreamExecutionEngine(config, Journal(config.journal_path))
+        engine.executor = self.CapturingExitExecutor()
+        engine.broker_state.uncertain = False
+        return engine
+
+    def make_position(self, qty: float = 14.2379, available_qty: float | None = None) -> LivePosition:
+        return LivePosition(
+            symbol="TQQQ",
+            strategy="momentum",
+            side="buy",
+            qty=qty,
+            avg_entry_price=70.21,
+            stop_price=69.32,
+            initial_risk_per_unit=0.89,
+            entry_time=pd.Timestamp("2026-05-06T14:46:00Z"),
+            available_qty=available_qty,
+        )
+
+    def test_scheduled_exit_skips_when_broker_available_qty_is_zero(self) -> None:
+        engine = self.make_engine()
+        position = self.make_position(available_qty=0.0)
+        engine.broker_state.positions["TQQQ"] = position
+
+        asyncio.run(engine._submit_exit("TQQQ", position, position.qty, "scheduled_close", pd.Timestamp("2026-05-06T19:59:00Z")))
+
+        executor = engine.executor
+        self.assertEqual([], executor.submitted)
+        self.assertFalse(engine.state_machine.orders)
+
+    def test_scheduled_exit_clamps_to_unreserved_available_qty(self) -> None:
+        engine = self.make_engine()
+        position = self.make_position(available_qty=14.2379)
+        engine.broker_state.positions["TQQQ"] = position
+        engine.state_machine.orders["existing-exit"] = LiveOrder(
+            client_order_id="existing-exit",
+            symbol="TQQQ",
+            strategy="momentum",
+            side="sell",
+            intended_qty=10.0,
+            intended_price=71.0,
+            signal_price=71.0,
+            stop_price=69.32,
+            status="accepted",
+            entry_exit="exit",
+        )
+
+        asyncio.run(engine._submit_exit("TQQQ", position, position.qty, "scheduled_close", pd.Timestamp("2026-05-06T19:59:00Z")))
+
+        executor = engine.executor
+        self.assertEqual(1, len(executor.submitted))
+        self.assertEqual(4.2379, executor.submitted[0][1])
+        new_orders = [order for order in engine.state_machine.orders.values() if order.client_order_id != "existing-exit"]
+        self.assertEqual(1, len(new_orders))
+        self.assertEqual(4.2379, new_orders[0].intended_qty)
 
 
 class ReconcileStateTests(unittest.TestCase):

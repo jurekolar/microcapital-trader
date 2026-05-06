@@ -15,6 +15,7 @@
       "filled_qty": 0.0,
       "intended_price": 88.46000000000001,
       "intended_qty": 11.3045,
+      "last_processed_fill_qty": 0.0,
       "last_update_time": "2026-05-06T13:46:01.597041+00:00",
       "rejection_reason": "403 Client Error: Forbidden for url: https://paper-api.alpaca.markets/v2/orders",
       "session_bucket": "open",
@@ -26,23 +27,7 @@
       "symbol": "NOW"
     }
   },
-  "positions": {
-    "TQQQ": {
-      "avg_entry_price": 70.21,
-      "entry_time": "2026-05-06T14:46:03.808252+00:00",
-      "initial_risk_per_unit": 0.0,
-      "partial_taken": false,
-      "qty": 14.2379,
-      "realized_pnl": 0.0,
-      "recovery_only": true,
-      "side": "buy",
-      "stop_price": 0.0,
-      "strategy": "momentum",
-      "symbol": "TQQQ"
-    }
-  },
-  "recovery_only": [
-    "TQQQ"
-  ],
+  "positions": {},
+  "recovery_only": [],
   "session_day": "2026-05-06"
 }
