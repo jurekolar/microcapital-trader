@@ -1,0 +1,187 @@
+//@version=6
+strategy(
+     title = "Microcapital VWAP Momentum Breakout",
+     shorttitle = "MC Momentum",
+     overlay = true,
+     initial_capital = 1000,
+     pyramiding = 0,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0,
+     process_orders_on_close = true,
+     calc_on_order_fills = true,
+     margin_long = 100,
+     margin_short = 100
+)
+
+// TradingView Pine Script v6 port of the Python `momentum` strategy in
+// microcapital_trader.py. Use on the same timeframe as the bot, 15 minutes by
+// default, for the closest comparison.
+
+const string signalGroup = "Signal"
+int emaFastLen = input.int(9, "EMA fast length", minval = 1, group = signalGroup)
+int emaSlowLen = input.int(20, "EMA slow length", minval = 1, group = signalGroup)
+int vwapLen = input.int(30, "Rolling VWAP window", minval = 1, group = signalGroup)
+int rvolLen = input.int(20, "Relative volume window", minval = 1, group = signalGroup)
+int breakoutLen = input.int(20, "Breakout lookback", minval = 1, group = signalGroup)
+float rvolThreshold = input.float(1.5, "Relative volume threshold", minval = 0.0, step = 0.1, group = signalGroup)
+float closeStrengthThreshold = input.float(0.6, "Candle close strength", minval = 0.0, maxval = 1.0, step = 0.05, group = signalGroup)
+bool allowShort = input.bool(true, "Allow shorts", group = signalGroup)
+
+const string riskGroup = "Risk"
+float riskPerTrade = input.float(5.0, "Risk per trade (%)", minval = 0.1, step = 0.1, group = riskGroup) / 100.0
+float maxDailyLoss = input.float(10.0, "Max daily closed loss (%)", minval = 0.1, step = 0.1, group = riskGroup) / 100.0
+int maxTradesPerDay = input.int(4, "Max trades per day", minval = 1, group = riskGroup)
+float stopBuffer = input.float(0.25, "Stop buffer (%)", minval = 0.0, step = 0.05, group = riskGroup) / 100.0
+float partialTargetR = input.float(1.0, "Partial target R", minval = 0.1, step = 0.1, group = riskGroup)
+float finalTargetR = input.float(2.0, "Final target R", minval = 2.0, step = 0.1, group = riskGroup)
+float maxPositionNotional = input.float(1000.0, "Max position notional, 0 = equity cap", minval = 0.0, step = 50.0, group = riskGroup)
+float qtyStep = input.float(0.0001, "Quantity step", minval = 0.0, step = 0.0001, group = riskGroup)
+
+const string executionGroup = "Execution Filters"
+bool useSessionFilter = input.bool(true, "Use regular session filter", group = executionGroup)
+string tradingSession = input.session("0930-1600:23456", "Trading session", group = executionGroup)
+string sessionTimezone = input.string("America/New_York", "Session timezone", group = executionGroup)
+bool useSpreadGate = input.bool(true, "Use modeled spread gate", group = executionGroup)
+float configuredSpreadBps = input.float(4.0, "Configured spread (bps)", minval = 0.0, step = 0.1, group = executionGroup)
+float estimatedSpreadBps = input.float(4.0, "Estimated current spread (bps)", minval = 0.0, step = 0.1, group = executionGroup)
+float maxSpreadMultiple = input.float(1.5, "Max spread multiple", minval = 0.1, step = 0.1, group = executionGroup)
+
+float emaFast = ta.ema(close, emaFastLen)
+float emaSlow = ta.ema(close, emaSlowLen)
+
+float vwapDenom = ta.sma(volume, vwapLen)
+float rollingVwap = not na(vwapDenom) and vwapDenom > 0.0 ? ta.sma(hlc3 * volume, vwapLen) / vwapDenom : na
+
+float avgVolume = ta.sma(volume, rvolLen)
+float rvol = not na(avgVolume) and avgVolume > 0.0 ? volume / avgVolume : na
+
+float candleRange = high - low
+float strongClose = candleRange > 0.0 ? (close - low) / candleRange : na
+float weakClose = candleRange > 0.0 ? (high - close) / candleRange : na
+float recentHigh = ta.highest(high, breakoutLen)[1]
+float recentLow = ta.lowest(low, breakoutLen)[1]
+
+bool inSession = not useSessionFilter or not na(time(timeframe.period, tradingSession, sessionTimezone))
+bool spreadOk = not useSpreadGate or estimatedSpreadBps <= configuredSpreadBps * maxSpreadMultiple
+bool indicatorsReady = not na(rollingVwap) and not na(rvol) and not na(recentHigh) and not na(recentLow)
+
+var int tradesToday = 0
+var float dailyClosedLoss = 0.0
+bool newDay = ta.change(time("D")) != 0
+if newDay
+    tradesToday := 0
+    dailyClosedLoss := 0.0
+
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    float lastTradeProfit = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if lastTradeProfit < 0.0
+        dailyClosedLoss += lastTradeProfit
+
+bool dailyRiskOk = tradesToday < maxTradesPerDay and math.abs(dailyClosedLoss) < strategy.equity * maxDailyLoss
+bool ready = inSession and spreadOk and indicatorsReady and dailyRiskOk
+bool flat = strategy.position_size == 0
+
+float longStopCandidate = math.min(recentHigh, low) * (1.0 - stopBuffer)
+float longRisk = close - longStopCandidate
+bool longSignal = ready and close > rollingVwap and emaFast > emaSlow and close > recentHigh and rvol > rvolThreshold and strongClose >= closeStrengthThreshold and longStopCandidate < close and longRisk > 0.0
+
+float shortStopCandidate = math.max(recentLow, high) * (1.0 + stopBuffer)
+float shortRisk = shortStopCandidate - close
+bool shortSignal = ready and allowShort and close < rollingVwap and emaFast < emaSlow and close < recentLow and rvol > rvolThreshold and weakClose >= closeStrengthThreshold and shortStopCandidate > close and shortRisk > 0.0
+
+float roundQty(float qty) =>
+    qtyStep > 0.0 ? math.round(qty / qtyStep) * qtyStep : qty
+
+float positionQty(float entryPrice, float stopPrice) =>
+    float riskAmount = strategy.equity * riskPerTrade
+    float riskPerUnit = math.abs(entryPrice - stopPrice)
+    float unitsByRisk = riskPerUnit > 0.0 ? riskAmount / riskPerUnit : 0.0
+    float unitsByCash = entryPrice > 0.0 ? strategy.equity / entryPrice : 0.0
+    float unitsByNotional = maxPositionNotional > 0.0 and entryPrice > 0.0 ? maxPositionNotional / entryPrice : unitsByCash
+    roundQty(math.max(math.min(math.min(unitsByRisk, unitsByCash), unitsByNotional), 0.0))
+
+var float tradeEntry = na
+var float tradeStop = na
+var float tradeTarget1 = na
+var float tradeTarget2 = na
+var bool partialTaken = false
+var int tradeEntryBar = na
+
+if flat and strategy.position_size[1] != 0
+    tradeEntry := na
+    tradeStop := na
+    tradeTarget1 := na
+    tradeTarget2 := na
+    partialTaken := false
+    tradeEntryBar := na
+
+if flat and longSignal
+    float longQty = positionQty(close, longStopCandidate)
+    if longQty > 0.0
+        tradeEntry := close
+        tradeStop := longStopCandidate
+        float longEntryRisk = tradeEntry - tradeStop
+        tradeTarget1 := tradeEntry + longEntryRisk * partialTargetR
+        tradeTarget2 := tradeEntry + longEntryRisk * finalTargetR
+        partialTaken := false
+        tradeEntryBar := bar_index
+        strategy.entry("Long", strategy.long, qty = longQty, comment = "vwap_breakout_long")
+        tradesToday += 1
+
+else if flat and shortSignal
+    float shortQty = positionQty(close, shortStopCandidate)
+    if shortQty > 0.0
+        tradeEntry := close
+        tradeStop := shortStopCandidate
+        float shortEntryRisk = tradeStop - tradeEntry
+        tradeTarget1 := tradeEntry - shortEntryRisk * partialTargetR
+        tradeTarget2 := tradeEntry - shortEntryRisk * finalTargetR
+        partialTaken := false
+        tradeEntryBar := bar_index
+        strategy.entry("Short", strategy.short, qty = shortQty, comment = "vwap_breakout_short")
+        tradesToday += 1
+
+bool canManageTrade = strategy.position_size != 0 and (na(tradeEntryBar) or bar_index > tradeEntryBar)
+
+if canManageTrade and strategy.position_size > 0 and not na(tradeStop)
+    float activeStop = partialTaken ? math.max(tradeStop, tradeEntry) : tradeStop
+    if not partialTaken
+        strategy.exit("Long TP1", "Long", limit = tradeTarget1, stop = activeStop, qty_percent = 50, comment = "partial_target")
+    strategy.exit("Long TP2", "Long", limit = tradeTarget2, stop = activeStop, comment = "target_or_stop")
+    if not partialTaken and high >= tradeTarget1
+        partialTaken := true
+    if close < emaFast
+        strategy.close("Long", comment = "structure_exit")
+
+if canManageTrade and strategy.position_size < 0 and not na(tradeStop)
+    float activeStop = partialTaken ? math.min(tradeStop, tradeEntry) : tradeStop
+    if not partialTaken
+        strategy.exit("Short TP1", "Short", limit = tradeTarget1, stop = activeStop, qty_percent = 50, comment = "partial_target")
+    strategy.exit("Short TP2", "Short", limit = tradeTarget2, stop = activeStop, comment = "target_or_stop")
+    if not partialTaken and low <= tradeTarget1
+        partialTaken := true
+    if close > emaFast
+        strategy.close("Short", comment = "structure_exit")
+
+float plottedStop = na
+if strategy.position_size > 0
+    plottedStop := partialTaken ? math.max(tradeStop, tradeEntry) : tradeStop
+if strategy.position_size < 0
+    plottedStop := partialTaken ? math.min(tradeStop, tradeEntry) : tradeStop
+
+plot(emaFast, "EMA fast", color = color.new(color.teal, 0))
+plot(emaSlow, "EMA slow", color = color.new(color.orange, 0))
+plot(rollingVwap, "Rolling VWAP", color = color.new(color.blue, 0))
+plot(recentHigh, "Prior high", color = color.new(color.green, 75), style = plot.style_linebr)
+plot(recentLow, "Prior low", color = color.new(color.red, 75), style = plot.style_linebr)
+plot(plottedStop, "Active stop", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeTarget1 : na, "Target 1", color = color.new(color.green, 30), style = plot.style_linebr)
+plot(strategy.position_size != 0 ? tradeTarget2 : na, "Target 2", color = color.new(color.green, 0), style = plot.style_linebr)
+
+plotshape(flat and longSignal, "Long signal", style = shape.triangleup, location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(flat and shortSignal, "Short signal", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0), size = size.tiny)
+
+alertcondition(flat and longSignal, "Momentum long setup", "Microcapital momentum long setup")
+alertcondition(flat and shortSignal, "Momentum short setup", "Microcapital momentum short setup")

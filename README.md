@@ -72,7 +72,7 @@ Notes:
 - For paper trading, use `https://paper-api.alpaca.markets`
 - For live trading, use `https://api.alpaca.markets`
 - Live mode is additionally gated by `ALLOW_LIVE=true`
-- Optional overrides include `MODE`, `SYMBOLS`, `ASSET_CLASS`, `RISK_PER_TRADE`, `SLIPPAGE_BPS`, `SPREAD_BPS`, and `TIMEFRAME`
+- Optional overrides include `MODE`, `SYMBOLS`, `ASSET_CLASS`, `ALLOW_SHORT`, `RISK_PER_TRADE`, `SLIPPAGE_BPS`, `SPREAD_BPS`, and `TIMEFRAME`
 
 ## Default Configuration
 
@@ -294,7 +294,8 @@ Available flags:
 - `scheduled_live` also requires `ALLOW_LIVE=true`
 - position sizing is capped by available account equity
 - the current execution path submits market orders only
-- short logic exists in the backtest and signal engine, but live tradability depends on your Alpaca account permissions
+- short logic exists in the backtest and signal engine, but paper/live short entries require `ALLOW_SHORT=true`, Alpaca `shorting_enabled=true`, and enough buying power for Alpaca's short-sell buying-power check
+- unsupported paper/live short entries are skipped locally before order submission; broker-side order rejections include Alpaca HTTP status, request ID, and response body in `rejection_reason`
 
 ## Limitations
 

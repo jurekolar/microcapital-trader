@@ -57,6 +57,9 @@ SCHEDULED_MODE_MAP: dict[str, str] = {
     "scheduled_live": "live",
 }
 
+TRUTHY_VALUES = {"1", "true", "yes", "y", "on"}
+FALSY_VALUES = {"0", "false", "no", "n", "off"}
+
 
 ORDER_TRANSITIONS: dict[str, set[str]] = {
     "new": {"accepted", "partially_filled", "filled", "canceled", "rejected", "pending_reconcile"},
@@ -67,6 +70,52 @@ ORDER_TRANSITIONS: dict[str, set[str]] = {
     "canceled": set(),
     "rejected": set(),
 }
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in TRUTHY_VALUES:
+            return True
+        if normalized in FALSY_VALUES:
+            return False
+        return default
+    return bool(value)
+
+
+def truncate_text(value: str, max_length: int = 500) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= max_length:
+        return compact
+    return f"{compact[: max_length - 3]}..."
+
+
+def format_http_error(exc: requests.HTTPError) -> str:
+    response = exc.response
+    if response is None:
+        return str(exc)
+    status_code = response.status_code
+    reason = response.reason or ""
+    status = f"HTTP {status_code}"
+    if reason:
+        status = f"{status} {reason}"
+    parts = [status]
+    request_id = response.headers.get("X-Request-ID") or response.headers.get("x-request-id")
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    body = ""
+    try:
+        body = json.dumps(response.json(), sort_keys=True, separators=(",", ":"))
+    except ValueError:
+        body = response.text or ""
+    body = truncate_text(body)
+    if body:
+        parts.append(f"body={body}")
+    return " ".join(parts)
 
 
 @dataclass
@@ -169,6 +218,8 @@ class Config:
             config.symbols = [s.strip() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
         if os.getenv("MODE"):
             config.mode = os.getenv("MODE", config.mode)
+        if os.getenv("ALLOW_SHORT"):
+            config.allow_short = parse_bool(os.getenv("ALLOW_SHORT"), config.allow_short)
         if os.getenv("RISK_PER_TRADE"):
             config.risk_per_trade = float(os.getenv("RISK_PER_TRADE", config.risk_per_trade))
         if os.getenv("SLIPPAGE_BPS"):
@@ -937,6 +988,7 @@ class BrokerState:
     account_equity: float = 0.0
     account_cash: float = 0.0
     buying_power: float = 0.0
+    shorting_enabled: bool = False
 
 
 @dataclass
@@ -1532,6 +1584,7 @@ class StreamExecutionEngine:
         self.stream_started_at: pd.Timestamp | None = None
         self.current_session_day = utc_now().date()
         self.quote_cache: dict[str, StreamQuote] = {}
+        self.short_entry_skip_notices: set[tuple[date, str, str]] = set()
         self._load_local_state()
 
     async def run(self) -> None:
@@ -1696,7 +1749,7 @@ class StreamExecutionEngine:
         qty = normalize_qty(self.config.asset_class, qty_basis)
         if qty <= 0:
             return
-        if not self._entry_risk_checks(symbol, price_reference, qty, quote):
+        if not self._entry_risk_checks(symbol, signal.side, price_reference, qty, quote):
             return
         client_order_id = deterministic_client_order_id(execution_mode(self.config.mode), signal.strategy, symbol, signal.side, "entry", signal.bar_time)
         if client_order_id in self.state_machine.orders and self.state_machine.orders[client_order_id].status in {"new", "accepted", "partially_filled", "filled"}:
@@ -2047,6 +2100,7 @@ class StreamExecutionEngine:
         self.broker_state.account_equity = float(account_payload.get("equity") or 0.0)
         self.broker_state.account_cash = float(account_payload.get("cash") or 0.0)
         self.broker_state.buying_power = float(account_payload.get("buying_power") or 0.0)
+        self.broker_state.shorting_enabled = parse_bool(account_payload.get("shorting_enabled"), False)
         combined_loss = -(self.broker_state.daily_realized_pnl + self.broker_state.daily_unrealized_pnl)
         capital_base = self.broker_state.account_equity or self.config.starting_capital
         self.broker_state.kill_switch_active = combined_loss >= (capital_base * self.config.max_daily_loss)
@@ -2093,6 +2147,7 @@ class StreamExecutionEngine:
 
     async def _submit_order_with_retry(self, order: LiveOrder, submitter: Any) -> None:
         attempts = 0
+        last_retryable_http_error = ""
         while attempts <= self.config.max_submit_retries:
             try:
                 response = submitter()
@@ -2108,18 +2163,20 @@ class StreamExecutionEngine:
                 return
             except requests.HTTPError as exc:
                 status_code = exc.response.status_code if exc.response is not None else 0
+                formatted_error = format_http_error(exc)
                 if 400 <= status_code < 500 and status_code != 429:
                     self.state_machine.apply_update(
                         client_order_id=order.client_order_id,
                         status="rejected",
                         filled_qty=order.filled_qty,
                         avg_fill_price=order.avg_fill_price,
-                        rejection_reason=str(exc),
+                        rejection_reason=formatted_error,
                         timestamp=utc_now(),
                     )
                     self._set_symbol_cooldown(order.symbol, self.config.cooldown_minutes_after_rejection)
                     self._persist_local_state()
                     return
+                last_retryable_http_error = formatted_error
                 attempts += 1
             except (requests.Timeout, requests.ConnectionError):
                 self.state_machine.apply_update(
@@ -2165,7 +2222,11 @@ class StreamExecutionEngine:
             status="rejected",
             filled_qty=order.filled_qty,
             avg_fill_price=order.avg_fill_price,
-            rejection_reason="submit_retry_exhausted",
+            rejection_reason=(
+                f"submit_retry_exhausted last_error={last_retryable_http_error}"
+                if last_retryable_http_error
+                else "submit_retry_exhausted"
+            ),
             timestamp=utc_now(),
         )
         self.broker_state.recovery_only_symbols.add(order.symbol)
@@ -2191,7 +2252,7 @@ class StreamExecutionEngine:
             return None
         return None
 
-    def _entry_risk_checks(self, symbol: str, price_reference: float, qty: float, quote: dict[str, Any]) -> bool:
+    def _entry_risk_checks(self, symbol: str, side: str, price_reference: float, qty: float, quote: dict[str, Any]) -> bool:
         if self.broker_state.uncertain or self.broker_state.kill_switch_active:
             return False
         spread_bps = float(quote.get("spread_bps") or 0.0)
@@ -2204,6 +2265,15 @@ class StreamExecutionEngine:
         current_gross_exposure = self._gross_exposure()
         proposed_notional = price_reference * qty
         live_capital = self._capital_base()
+        required_buying_power = proposed_notional
+        if side == "sell" and self.config.asset_class == "equity":
+            if not self.config.allow_short:
+                return self._skip_short_entry(symbol, "shorts_disabled", "ALLOW_SHORT=false")
+            if not self.broker_state.shorting_enabled:
+                return self._skip_short_entry(symbol, "account_shorting_disabled", "shorting_enabled=false")
+            ask = float(quote.get("ask") or 0.0)
+            short_reference = ask if ask > 0 else price_reference
+            required_buying_power = short_reference * qty * 1.03
         if current_symbol_exposure >= self.config.max_symbol_exposure:
             return False
         if current_gross_exposure >= self.config.max_gross_exposure:
@@ -2214,11 +2284,21 @@ class StreamExecutionEngine:
             return False
         if current_gross_exposure + proposed_notional > self.config.max_gross_exposure:
             return False
-        if proposed_notional > self.broker_state.account_cash > 0:
+        if required_buying_power > self.broker_state.buying_power:
+            if side == "sell" and self.config.asset_class == "equity":
+                detail = f"required_buying_power={required_buying_power:.2f} available={self.broker_state.buying_power:.2f}"
+                return self._skip_short_entry(symbol, "insufficient_short_buying_power", detail)
             return False
         if live_capital <= 0:
             return False
         return True
+
+    def _skip_short_entry(self, symbol: str, reason: str, detail: str) -> bool:
+        key = (self.current_session_day, symbol, reason)
+        if key not in self.short_entry_skip_notices:
+            self.short_entry_skip_notices.add(key)
+            print(f"Short entry skipped for {symbol}: {reason} ({detail})")
+        return False
 
     def _active_entry_layers(self, symbol: str, strategy_name: str) -> int:
         layers = 0
