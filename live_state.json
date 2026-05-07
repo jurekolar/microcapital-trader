@@ -241,24 +241,35 @@
       "stop_price": 71.8948125,
       "strategy": "momentum",
       "symbol": "TQQQ"
-    }
-  },
-  "positions": {
-    "MSFT": {
-      "available_qty": 2.3917,
-      "avg_entry_price": 426.244181,
-      "entry_time": "2026-05-07T13:46:01.664724+00:00",
-      "initial_risk_per_unit": 8.801999999999964,
-      "partial_taken": false,
-      "qty": 2.3917,
-      "realized_pnl": 0.0,
-      "recovery_only": false,
-      "side": "buy",
+    },
+    "mc-p-momentum-exittargetor-MSFT-6513bcd09f70c5627665": {
+      "avg_fill_price": 423.52,
+      "bar_time": "2026-05-07T16:00:00+00:00",
+      "broker_order_id": "5ddafc43-c67f-4c7f-bd62-094350be1b7e",
+      "client_order_id": "mc-p-momentum-exittargetor-MSFT-6513bcd09f70c5627665",
+      "entry_exit": "exit",
+      "estimated_spread_cost": 9.208045000000055,
+      "expected_spread_bps": 90.5722519555378,
+      "fallback_used": false,
+      "filled_qty": 1.0,
+      "intended_price": 425.075,
+      "intended_qty": 2.3917,
+      "last_processed_fill_qty": 0.0,
+      "last_update_time": "2026-05-07T16:16:05.236170+00:00",
+      "quote_age_seconds": 0.203941,
+      "quote_source": "stream",
+      "rejection_reason": "",
+      "session_bucket": "midday",
+      "side": "sell",
+      "signal_price": 425.075,
+      "spread_bps_at_submission": 90.5722519555378,
+      "status": "partially_filled",
       "stop_price": 417.75300000000004,
       "strategy": "momentum",
       "symbol": "MSFT"
     }
   },
+  "positions": {},
   "recovery_only": [],
   "session_day": "2026-05-07"
 }
