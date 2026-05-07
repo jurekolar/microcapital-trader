@@ -875,6 +875,135 @@ class AggressiveBacktestParityTests(unittest.TestCase):
             DataLoader(config).load_historical_data("NOLOCAL")
 
 
+class StreamLifecycleTests(unittest.TestCase):
+    def make_engine(self) -> StreamExecutionEngine:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="paper",
+            asset_class="equity",
+            symbols=["AAPL"],
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+            alpaca_api_key="key",
+            alpaca_secret_key="secret",
+        )
+        return StreamExecutionEngine(config, Journal(config.journal_path))
+
+    def test_stream_run_does_not_print_implementation_plan_by_default(self) -> None:
+        engine = self.make_engine()
+        history = pd.DataFrame(
+            [
+                {
+                    "timestamp": pd.Timestamp("2026-05-06T14:30:00Z"),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.5,
+                    "volume": 1000,
+                    "symbol": "AAPL",
+                }
+            ]
+        )
+
+        with patch("microcapital_trader.ALPACA_AVAILABLE", True):
+            with patch("microcapital_trader.TradingClient", return_value=object()):
+                with patch("microcapital_trader.DataLoader.load_historical_data", return_value=history):
+                    with patch.object(StreamExecutionEngine, "_validate_live_config"):
+                        with patch.object(StreamExecutionEngine, "_safe_reconcile"):
+                            with patch.object(
+                                StreamExecutionEngine,
+                                "_run_streams",
+                                side_effect=asyncio.CancelledError,
+                            ):
+                                output = io.StringIO()
+                                with redirect_stdout(output):
+                                    with self.assertRaises(asyncio.CancelledError):
+                                        asyncio.run(engine.run())
+
+        self.assertNotIn("Implementation plan", output.getvalue())
+
+    def test_data_stream_auth_failure_bubbles_and_closes_connection(self) -> None:
+        class FailingDataStream:
+            def __init__(self) -> None:
+                self._running = False
+                self.closed = False
+
+            async def _start_ws(self) -> None:
+                raise ValueError("connection limit exceeded")
+
+            async def _send_subscribe_msg(self) -> None:
+                raise AssertionError("subscribe should not run after auth failure")
+
+            async def _consume(self) -> None:
+                raise AssertionError("consume should not run after auth failure")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        engine = self.make_engine()
+        stream = FailingDataStream()
+
+        with self.assertRaisesRegex(ValueError, "connection limit exceeded"):
+            asyncio.run(engine._run_data_stream(stream))
+
+        self.assertFalse(stream._running)
+        self.assertTrue(stream.closed)
+
+    def test_shutdown_signals_streams_before_forcing_task_cancellation(self) -> None:
+        class StoppableStream:
+            def __init__(self) -> None:
+                self.stop_event = asyncio.Event()
+                self.calls: list[str] = []
+
+            async def stop_ws(self) -> None:
+                self.calls.append("stop_ws")
+                self.stop_event.set()
+
+            async def close(self) -> None:
+                self.calls.append("close")
+
+        async def run_case() -> tuple[StoppableStream, StoppableStream, bool, bool, bool]:
+            engine = self.make_engine()
+            data_stream = StoppableStream()
+            trading_stream = StoppableStream()
+
+            async def wait_for_stop(stream: StoppableStream) -> None:
+                await stream.stop_event.wait()
+
+            async def wait_forever() -> None:
+                await asyncio.Event().wait()
+
+            data_task = asyncio.create_task(wait_for_stop(data_stream))
+            trading_task = asyncio.create_task(wait_for_stop(trading_stream))
+            watcher_task = asyncio.create_task(wait_forever())
+
+            await engine._shutdown_streams(
+                streams=(data_stream, trading_stream),
+                stream_tasks=(data_task, trading_task),
+                watcher_task=watcher_task,
+            )
+
+            return (
+                data_stream,
+                trading_stream,
+                data_task.done(),
+                trading_task.done(),
+                watcher_task.cancelled(),
+            )
+
+        data_stream, trading_stream, data_done, trading_done, watcher_cancelled = asyncio.run(
+            run_case()
+        )
+
+        self.assertEqual(["stop_ws", "close"], data_stream.calls)
+        self.assertEqual(["stop_ws", "close"], trading_stream.calls)
+        self.assertTrue(data_done)
+        self.assertTrue(trading_done)
+        self.assertTrue(watcher_cancelled)
+
+
 class LiveConfigValidationTests(unittest.TestCase):
     def test_paper_mode_rejects_live_endpoint(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()

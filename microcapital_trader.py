@@ -2275,7 +2275,6 @@ class StreamExecutionEngine:
         if not ALPACA_AVAILABLE:
             raise RuntimeError("alpaca-py is required for paper/live WebSocket execution.")
         self._validate_live_config()
-        print(PLAN_TEXT.strip())
         self.trading_client = TradingClient(
             self.config.alpaca_api_key,
             self.config.alpaca_secret_key,
@@ -2371,32 +2370,87 @@ class StreamExecutionEngine:
         self.last_market_data_time = utc_now()
         self.last_trade_update_time = utc_now()
 
-        data_task = asyncio.create_task(data_stream._run_forever())
-        trading_task = asyncio.create_task(trading_stream._run_forever())
+        data_task = asyncio.create_task(self._run_data_stream(data_stream))
+        trading_task = asyncio.create_task(self._run_trading_stream(trading_stream))
         watcher_task = asyncio.create_task(self._watch_stream_health())
 
         try:
-            done, pending = await asyncio.wait(
+            done, _pending = await asyncio.wait(
                 {data_task, trading_task, watcher_task},
-                return_when=asyncio.FIRST_EXCEPTION,
+                return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
+                if task.cancelled():
+                    continue
                 exc = task.exception()
                 if exc is not None:
                     raise exc
             raise RuntimeError("Stream task exited unexpectedly.")
         finally:
-            for task in (watcher_task, data_task, trading_task):
+            await self._shutdown_streams(
+                streams=(data_stream, trading_stream),
+                stream_tasks=(data_task, trading_task),
+                watcher_task=watcher_task,
+            )
+
+    async def _run_data_stream(self, data_stream: Any) -> None:
+        data_stream._loop = asyncio.get_running_loop()
+        data_stream._should_run = True
+        data_stream._running = False
+        try:
+            await data_stream._start_ws()
+            await data_stream._send_subscribe_msg()
+            data_stream._running = True
+            await data_stream._consume()
+        finally:
+            data_stream._running = False
+            await self._close_stream(data_stream)
+
+    async def _run_trading_stream(self, trading_stream: Any) -> None:
+        trading_stream._loop = asyncio.get_running_loop()
+        trading_stream._should_run = True
+        trading_stream._running = False
+        try:
+            await trading_stream._start_ws()
+            trading_stream._running = True
+            await trading_stream._consume()
+        finally:
+            trading_stream._running = False
+            await self._close_stream(trading_stream)
+
+    async def _shutdown_streams(
+        self,
+        streams: tuple[Any, ...],
+        stream_tasks: tuple[asyncio.Task[Any], ...],
+        watcher_task: asyncio.Task[Any],
+    ) -> None:
+        watcher_task.cancel()
+        await asyncio.gather(watcher_task, return_exceptions=True)
+        for stream in streams:
+            await self._call_stream_method(stream, "stop_ws")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*stream_tasks, return_exceptions=True),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            for task in stream_tasks:
                 task.cancel()
-            for stream in (data_stream, trading_stream):
-                for method_name in ("stop_ws", "stop", "close"):
-                    method = getattr(stream, method_name, None)
-                    if callable(method):
-                        result = method()
-                        if asyncio.iscoroutine(result):
-                            await result
-                        break
-            await asyncio.gather(data_task, trading_task, watcher_task, return_exceptions=True)
+            await asyncio.gather(*stream_tasks, return_exceptions=True)
+        finally:
+            for stream in streams:
+                await self._close_stream(stream)
+
+    async def _close_stream(self, stream: Any) -> None:
+        await self._call_stream_method(stream, "close")
+
+    async def _call_stream_method(self, stream: Any, method_name: str) -> None:
+        method = getattr(stream, method_name, None)
+        if not callable(method):
+            return
+        result = method()
+        if asyncio.iscoroutine(result):
+            await result
 
     async def _on_closed_bar(self, symbol: str, bar_row: pd.Series) -> None:
         self._roll_session_day_if_needed(utc_timestamp(bar_row["timestamp"]))
