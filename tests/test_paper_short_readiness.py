@@ -2,6 +2,8 @@ import asyncio
 import csv
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -21,11 +23,13 @@ from microcapital_trader import (
     LivePosition,
     OptimizationWindow,
     Signal,
+    SingleInstanceLock,
     StreamExecutionEngine,
     StreamQuote,
     SymbolBasket,
     VWAPMomentumBreakoutStrategy,
     format_http_error,
+    is_connection_limit_error,
     optimize_for_total_return,
     utc_now,
 )
@@ -1002,6 +1006,53 @@ class StreamLifecycleTests(unittest.TestCase):
         self.assertTrue(data_done)
         self.assertTrue(trading_done)
         self.assertTrue(watcher_cancelled)
+
+    def test_connection_limit_detection_walks_exception_chain(self) -> None:
+        exc = RuntimeError("wrapper")
+        exc.__cause__ = ValueError("connection limit exceeded")
+
+        self.assertTrue(is_connection_limit_error(exc))
+
+    def test_scheduled_lock_blocks_second_instance(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        lock_path = Path(temp_dir.name) / "scheduled.lock"
+        child_code = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from microcapital_trader import SingleInstanceLock\n"
+            "lock = SingleInstanceLock(Path(sys.argv[1]), 'scheduled_paper')\n"
+            "lock.acquire()\n"
+            "print('locked', flush=True)\n"
+            "time.sleep(10)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(lock_path)],
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(self._cleanup_process, process)
+        self.assertEqual("locked", process.stdout.readline().strip())
+
+        second_lock = SingleInstanceLock(lock_path, "scheduled_paper")
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "scheduled_paper is already running"):
+                second_lock.acquire()
+        finally:
+            process.terminate()
+            process.communicate(timeout=5)
+
+    def _cleanup_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+            process.communicate(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 class LiveConfigValidationTests(unittest.TestCase):

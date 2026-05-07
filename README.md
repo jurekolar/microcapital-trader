@@ -319,7 +319,6 @@ Available flags:
 - `--state-path PATH`
 - `--optimization-output-path PATH`
 - `--strict-data`
-- `--show-plan`
 
 ## Safety Notes
 

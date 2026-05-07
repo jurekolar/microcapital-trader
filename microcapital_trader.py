@@ -40,18 +40,6 @@ except ImportError:  # pragma: no cover - optional dependency path
     ALPACA_AVAILABLE = False
 
 
-PLAN_TEXT = """Implementation plan
-- Modules/classes: Config, Journal, DataLoader, Strategy base, VWAPMomentumBreakoutStrategy, BacktestEngine, OrderStateMachine, BrokerState, EquitiesExecutor, CryptoExecutor, StreamExecutionEngine, TradingBot.
-- Data flow: historical/stream data -> indicators/bar aggregation -> strategy signal on bar close -> order intent/submission -> broker updates/fills -> order/position state -> CSV journal and backtest metrics.
-- Strategy: momentum exposes generate_signal(history, symbol, config, spread_bps); compare mode reports the same momentum path.
-- Modes: backtest replays bars with modeled spread/slippage; paper/live use Alpaca REST for startup/reconcile/order submit and WebSocket streams for market/order events.
-- WebSocket execution: market data stream feeds bar aggregation, closed bars trigger signals, trading stream feeds order state transitions and fills.
-- State machine: explicit new/accepted/partially_filled/filled/canceled/rejected transitions with validation; positions are rebuilt from actual fills only.
-- Equities vs crypto: separate executors and separate data streams/quote fetches; equities support fractional shares with stock rules, crypto uses crypto-specific submission behavior.
-- Slippage: backtest applies spread + slippage at entry and exit; paper/live log signal price, intended price, actual fill, estimated spread cost, estimated slippage.
-- Reconciliation: reconcile_state() runs on startup, after exceptions, after reconnects, and before new orders when state is uncertain by fetching open orders and positions and rebuilding local state.
-"""
-
 SCHEDULED_MODE_MAP: dict[str, str] = {
     "scheduled_paper": "paper",
     "scheduled_live": "live",
@@ -307,6 +295,17 @@ def execution_mode(mode: str) -> str:
 
 def is_scheduled_mode(mode: str) -> bool:
     return mode in SCHEDULED_MODE_MAP
+
+
+def is_connection_limit_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if "connection limit exceeded" in str(current).lower():
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def normalize_order_status(status: Any) -> str:
@@ -2295,6 +2294,13 @@ class StreamExecutionEngine:
             except Exception as exc:
                 self.broker_state.uncertain = True
                 self._safe_reconcile()
+                if is_connection_limit_error(exc):
+                    raise RuntimeError(
+                        "Alpaca stream connection limit exceeded. Another bot, scheduled task, "
+                        "or dashboard is already using the same market-data connection. Stop the "
+                        "other process or wait for Alpaca to release the connection, then start "
+                        "scheduled_paper again."
+                    ) from exc
                 wait_seconds = min(backoff, self.config.reconnect_backoff_max_seconds) + random.uniform(0.0, self.config.reconnect_jitter_seconds)
                 print(f"Stream reconnect required: {exc}. Retrying in {wait_seconds:.1f}s")
                 await asyncio.sleep(wait_seconds)
@@ -3488,41 +3494,108 @@ class StreamExecutionEngine:
         self.state_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
 
+class SingleInstanceLock:
+    def __init__(self, path: Path, mode: str):
+        self.path = path
+        self.mode = mode
+        self.handle: Any | None = None
+
+    def __enter__(self) -> "SingleInstanceLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self.release()
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("a+")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.lockf(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                f"{self.mode} is already running. Stop the existing process before starting another one. "
+                f"Lock file: {self.path}"
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\nmode={self.mode}\nstarted_at={utc_now().isoformat()}\n")
+        handle.flush()
+        self.handle = handle
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.lockf(self.handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self.handle.close()
+            self.handle = None
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+
+
 class ScheduledSessionRunner:
     def __init__(self, config: Config, journal: Journal):
         self.config = config
         self.journal = journal
 
     async def run(self) -> None:
-        trade_mode = execution_mode(self.config.mode)
-        if trade_mode not in {"paper", "live"}:
-            raise ValueError("Scheduled mode requires paper or live execution.")
-        if self.config.asset_class != "equity":
-            raise ValueError("Scheduled mode is only implemented for equities.")
-        scheduled_config = replace(self.config, mode=trade_mode)
-        session = self._next_session_window(utc_now(), scheduled_config)
-        await self._sleep_until(session["start"], f"waiting for scheduled start at {session['start'].isoformat()}")
-        engine = StreamExecutionEngine(scheduled_config, self.journal)
-        engine_task = asyncio.create_task(engine.run())
-        flattened = False
-        try:
-            while True:
-                now = utc_now()
-                if not flattened and now >= session["flatten"]:
-                    print(f"Scheduled flatten window reached at {now.isoformat()}")
-                    await engine.flatten_for_session_close(reason="scheduled_close")
-                    flattened = True
-                if now >= session["stop"]:
-                    print(f"Scheduled shutdown window reached at {now.isoformat()}")
-                    break
-                if engine_task.done():
-                    await engine_task
-                    return
-                await asyncio.sleep(min(self.config.schedule_poll_seconds, 30))
-        finally:
-            if not engine_task.done():
-                engine_task.cancel()
-                await asyncio.gather(engine_task, return_exceptions=True)
+        with SingleInstanceLock(self._lock_path(), self.config.mode):
+            trade_mode = execution_mode(self.config.mode)
+            if trade_mode not in {"paper", "live"}:
+                raise ValueError("Scheduled mode requires paper or live execution.")
+            if self.config.asset_class != "equity":
+                raise ValueError("Scheduled mode is only implemented for equities.")
+            scheduled_config = replace(self.config, mode=trade_mode)
+            session = self._next_session_window(utc_now(), scheduled_config)
+            await self._sleep_until(session["start"], f"waiting for scheduled start at {session['start'].isoformat()}")
+            engine = StreamExecutionEngine(scheduled_config, self.journal)
+            engine_task = asyncio.create_task(engine.run())
+            flattened = False
+            try:
+                while True:
+                    now = utc_now()
+                    if not flattened and now >= session["flatten"]:
+                        print(f"Scheduled flatten window reached at {now.isoformat()}")
+                        await engine.flatten_for_session_close(reason="scheduled_close")
+                        flattened = True
+                    if now >= session["stop"]:
+                        print(f"Scheduled shutdown window reached at {now.isoformat()}")
+                        break
+                    if engine_task.done():
+                        await engine_task
+                        return
+                    await asyncio.sleep(min(self.config.schedule_poll_seconds, 30))
+            finally:
+                if not engine_task.done():
+                    engine_task.cancel()
+                    await asyncio.gather(engine_task, return_exceptions=True)
+
+    def _lock_path(self) -> Path:
+        state_path = Path(self.config.state_path)
+        return state_path.with_name(f"{state_path.stem}.{self.config.mode}.lock")
 
     async def _sleep_until(self, target: pd.Timestamp, message: str) -> None:
         delay = max((target - utc_now()).total_seconds(), 0.0)
@@ -3617,9 +3690,7 @@ class TradingBot:
         except KeyboardInterrupt:
             print("Shutdown requested. Exiting cleanly.")
 
-    def run(self, compare: bool = False, show_plan: bool = False) -> None:
-        if show_plan:
-            print(PLAN_TEXT.strip())
+    def run(self, compare: bool = False) -> None:
         if compare:
             frame = compare_strategies(self.config)
             print_strategy_comparison(frame)
@@ -3657,7 +3728,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--state-path", default=None)
     parser.add_argument("--optimization-output-path", default=None)
     parser.add_argument("--strict-data", action="store_true", help="Refuse synthetic sample data in backtests.")
-    parser.add_argument("--show-plan", action="store_true", help="Print the short implementation plan before running.")
     return parser.parse_args()
 
 
@@ -3692,7 +3762,7 @@ def main() -> None:
         config.optimization_output_path = args.optimization_output_path
     if args.strict_data:
         config.strict_data = True
-    TradingBot(config).run(compare=args.compare, show_plan=args.show_plan)
+    TradingBot(config).run(compare=args.compare)
 
 
 if __name__ == "__main__":
