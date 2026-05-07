@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import io
 import json
 import tempfile
@@ -10,7 +11,13 @@ from unittest.mock import patch
 import pandas as pd
 import requests
 
-from microcapital_trader import Config, Journal, LiveOrder, LivePosition, Signal, StreamExecutionEngine, format_http_error, utc_now
+import microcapital_trader as trader
+from microcapital_trader import BacktestEngine, Config, Journal, LiveOrder, LivePosition, Signal, StreamExecutionEngine, StreamQuote, format_http_error, utc_now
+
+
+def journal_rows(path: str) -> list[dict[str, str]]:
+    with Path(path).open(newline="") as handle:
+        return list(csv.DictReader(handle))
 
 
 class HttpErrorFormattingTests(unittest.TestCase):
@@ -99,6 +106,28 @@ class EntryRiskCheckTests(unittest.TestCase):
 
         self.assertEqual(70.15, quote["mid"])
         self.assertEqual(0.0, quote["spread_bps"])
+        self.assertEqual("fallback_signal", quote["quote_source"])
+        self.assertTrue(quote["fallback_used"])
+        self.assertEqual(0.0, quote["quote_age_seconds"])
+
+    def test_stream_quote_records_non_blocking_submission_metadata(self) -> None:
+        engine = self.make_engine()
+        quote_time = utc_now() - pd.Timedelta(seconds=45)
+        engine.quote_cache["TQQQ"] = StreamQuote(
+            symbol="TQQQ",
+            bid=70.0,
+            ask=70.7,
+            mid=70.35,
+            spread_bps=99.502488,
+            timestamp=quote_time,
+        )
+
+        quote = engine._stream_quote_snapshot_or_fallback("TQQQ", 70.15, pd.Timestamp("2026-05-06T14:45:00Z"))
+
+        self.assertEqual("stream", quote["quote_source"])
+        self.assertFalse(quote["fallback_used"])
+        self.assertGreaterEqual(quote["quote_age_seconds"], 45.0)
+        self.assertEqual(99.502488, quote["spread_bps"])
 
 
 class EntrySubmissionRelaxationTests(unittest.TestCase):
@@ -179,6 +208,16 @@ class EntrySubmissionRelaxationTests(unittest.TestCase):
         order = next(iter(engine.state_machine.orders.values()))
         self.assertEqual(100.0, order.intended_price)
         self.assertEqual(0.0, order.expected_spread_bps)
+        self.assertEqual("fallback_signal", order.quote_source)
+        self.assertTrue(order.fallback_used)
+
+        rows = journal_rows(engine.config.journal_path)
+        new_row = next(row for row in rows if row["event"] == "new")
+        self.assertIn("quote_source=fallback_signal", new_row["notes"])
+        self.assertIn("fallback_used=true", new_row["notes"])
+        self.assertIn("quote_age_seconds=0.0", new_row["notes"])
+        self.assertIn("spread_bps=0.0", new_row["notes"])
+        self.assertIn("broker_rejected=false", new_row["notes"])
 
 
 class SubmitFillReconciliationTests(unittest.TestCase):
@@ -229,6 +268,9 @@ class SubmitFillReconciliationTests(unittest.TestCase):
         self.assertEqual(95.0, position.stop_price)
         self.assertEqual(6.0, position.initial_risk_per_unit)
         self.assertEqual(5.0, engine.state_machine.orders[order.client_order_id].last_processed_fill_qty)
+        filled_row = next(row for row in journal_rows(engine.config.journal_path) if row["event"] == "filled")
+        self.assertIn("actual_slippage_bps=100.0", filled_row["notes"])
+        self.assertIn("broker_rejected=false", filled_row["notes"])
 
     def test_immediate_partially_filled_submit_rebuilds_position_once(self) -> None:
         engine = self.make_engine()
@@ -308,6 +350,35 @@ class SubmitFillReconciliationTests(unittest.TestCase):
 
         self.assertEqual("filled", engine.state_machine.orders[order.client_order_id].status)
         self.assertNotIn("AAPL", engine.broker_state.positions)
+
+    def test_broker_rejection_notes_non_blocking_metric(self) -> None:
+        engine = self.make_engine()
+        order = self.make_order()
+        engine.state_machine.register_intent(order)
+        response = requests.Response()
+        response.status_code = 403
+        response.reason = "Forbidden"
+        response._content = b'{"message":"insufficient buying power"}'
+        exc = requests.HTTPError("403 Client Error", response=response)
+
+        class EmptyLookupResponse:
+            def json(self) -> list[dict[str, str]]:
+                return []
+
+            def raise_for_status(self) -> None:
+                return None
+
+        with patch("microcapital_trader.requests.get", return_value=EmptyLookupResponse()):
+            asyncio.run(
+                engine._submit_order_with_retry(
+                    order,
+                    lambda: (_ for _ in ()).throw(exc),
+                )
+            )
+
+        rejected_row = next(row for row in journal_rows(engine.config.journal_path) if row["event"] == "rejected")
+        self.assertIn("HTTP 403 Forbidden", rejected_row["rejection_reason"])
+        self.assertIn("broker_rejected=true", rejected_row["notes"])
 
 
 class ExitSubmissionSizingTests(unittest.TestCase):
@@ -410,21 +481,21 @@ class ReconcileStateTests(unittest.TestCase):
         )
         return StreamExecutionEngine(config, Journal(config.journal_path))
 
-    def fake_get(self, positions: list[dict[str, str]]):
+    def fake_get(self, positions: list[dict[str, str]], account: dict[str, str | bool] | None = None):
+        account_payload = account or {
+            "equity": "10000",
+            "cash": "10000",
+            "buying_power": "0",
+            "shorting_enabled": False,
+        }
+
         def _fake_get(url: str, **kwargs: object) -> ReconcileStateTests.FakeResponse:
             if url.endswith("/v2/orders"):
                 return self.FakeResponse([])
             if url.endswith("/v2/positions"):
                 return self.FakeResponse(positions)
             if url.endswith("/v2/account"):
-                return self.FakeResponse(
-                    {
-                        "equity": "10000",
-                        "cash": "10000",
-                        "buying_power": "0",
-                        "shorting_enabled": False,
-                    }
-                )
+                return self.FakeResponse(account_payload)
             raise AssertionError(f"Unexpected URL: {url}")
 
         return _fake_get
@@ -486,6 +557,100 @@ class ReconcileStateTests(unittest.TestCase):
         self.assertTrue(position.recovery_only)
         self.assertNotIn("AAPL", engine.broker_state.recovery_only_symbols)
         self.assertTrue(engine._can_trade_symbol("AAPL"))
+
+    def test_reconcile_logs_recovery_only_once_per_session(self) -> None:
+        engine = self.make_engine()
+        self.write_state(engine, {"orders": {}, "positions": {}})
+        positions = [{"symbol": "AAPL", "qty": "5", "avg_entry_price": "101", "unrealized_pl": "0"}]
+
+        with patch("microcapital_trader.requests.get", side_effect=self.fake_get(positions)):
+            engine.reconcile_state()
+            engine.reconcile_state()
+
+        recovery_rows = [row for row in journal_rows(engine.config.journal_path) if row["event"] == "recovery_only"]
+        self.assertEqual(1, len(recovery_rows))
+        self.assertEqual("state", recovery_rows[0]["entry_exit"])
+        self.assertIn("position_state=recovery_only", recovery_rows[0]["notes"])
+        self.assertIn("reason=missing_stop_or_risk_metadata", recovery_rows[0]["notes"])
+
+    def test_reconcile_logs_account_snapshot_only_when_daily_pnl_changes(self) -> None:
+        engine = self.make_engine()
+        self.write_state(engine, {"orders": {}, "positions": {}, "daily_realized_pnl": 0.0})
+
+        with patch("microcapital_trader.requests.get", side_effect=self.fake_get([])):
+            engine.reconcile_state()
+            engine.reconcile_state()
+
+        account_rows = [row for row in journal_rows(engine.config.journal_path) if row["event"] == "account_snapshot"]
+        self.assertEqual(1, len(account_rows))
+        self.assertIn("daily_realized_pnl=0.0", account_rows[0]["notes"])
+        self.assertIn("daily_unrealized_pnl=0.0", account_rows[0]["notes"])
+
+        self.write_state(engine, {"orders": {}, "positions": {}, "daily_realized_pnl": 12.5})
+        with patch("microcapital_trader.requests.get", side_effect=self.fake_get([])):
+            engine.reconcile_state()
+
+        account_rows = [row for row in journal_rows(engine.config.journal_path) if row["event"] == "account_snapshot"]
+        self.assertEqual(2, len(account_rows))
+        self.assertIn("daily_realized_pnl=12.5", account_rows[-1]["notes"])
+
+
+class BacktestMetricsTests(unittest.TestCase):
+    class OneSignalStrategy:
+        def generate_signal(self, symbol: str, history: pd.DataFrame, config: Config, estimated_spread_bps: float) -> Signal | None:
+            if len(history) != 2:
+                return None
+            return Signal(
+                strategy="metric_test",
+                symbol=symbol,
+                side="buy",
+                entry=100.0,
+                stop=95.0,
+                target_1=105.0,
+                target_2=110.0,
+                reason="test_signal",
+                bar_time=history.iloc[-1]["timestamp"],
+            )
+
+    def test_backtest_journal_and_summary_include_modeled_metrics_without_extra_rejections(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="backtest",
+            strategy="metric_test",
+            asset_class="equity",
+            symbols=["AAPL"],
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+            spread_bps=7.0,
+            slippage_bps=3.0,
+        )
+        data = pd.DataFrame(
+            [
+                {"timestamp": pd.Timestamp("2026-05-06T14:30:00Z"), "open": 99.0, "high": 101.0, "low": 98.0, "close": 100.0, "volume": 1000, "ema_fast": 100.0, "symbol": "AAPL"},
+                {"timestamp": pd.Timestamp("2026-05-06T14:45:00Z"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1200, "ema_fast": 100.0, "symbol": "AAPL"},
+                {"timestamp": pd.Timestamp("2026-05-06T15:00:00Z"), "open": 100.0, "high": 101.0, "low": 94.0, "close": 95.0, "volume": 1300, "ema_fast": 100.0, "symbol": "AAPL"},
+            ]
+        )
+
+        with patch.dict(trader.STRATEGIES, {"metric_test": self.OneSignalStrategy()}):
+            with patch("microcapital_trader.DataLoader.load_historical_data", return_value=data):
+                result = BacktestEngine(config, Journal(config.journal_path)).run()
+
+        self.assertEqual(1, result["trade_count"])
+        self.assertEqual(0, result["fallback_count"])
+        self.assertEqual('{"bar_model": 1}', result["quote_source_counts"])
+        self.assertEqual(7.0, result["modeled_spread_bps"])
+        self.assertEqual(3.0, result["modeled_slippage_bps"])
+        self.assertEqual(0, result["rejected_trade_count"])
+
+        trade_row = next(row for row in journal_rows(config.journal_path) if row["entry_exit"] == "round_trip")
+        self.assertIn("quote_source=bar_model", trade_row["notes"])
+        self.assertIn("fallback_used=false", trade_row["notes"])
+        self.assertIn("quote_age_seconds=0", trade_row["notes"])
+        self.assertIn("spread_bps=7.0", trade_row["notes"])
+        self.assertIn("modeled_slippage_bps=3.0", trade_row["notes"])
 
 
 class LiveConfigValidationTests(unittest.TestCase):

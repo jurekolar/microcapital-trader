@@ -435,6 +435,41 @@ def normalize_base_url(url: str) -> str:
     return url.strip().rstrip("/")
 
 
+def format_note_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return ""
+        return str(round(value, 6))
+    if isinstance(value, int):
+        return str(value)
+    return str(value).strip().replace(" ", "_")
+
+
+def format_note_pairs(**pairs: Any) -> str:
+    parts = []
+    for key, value in pairs.items():
+        if value is None:
+            continue
+        formatted = format_note_value(value)
+        if formatted == "":
+            continue
+        parts.append(f"{key}={formatted}")
+    return " ".join(parts)
+
+
+def merge_notes(*notes: str) -> str:
+    return " ".join(part.strip() for part in notes if part and part.strip())
+
+
+def quote_age_seconds(timestamp: pd.Timestamp | None, now: pd.Timestamp | None = None) -> float:
+    if timestamp is None:
+        return 0.0
+    reference = now or utc_now()
+    return max((utc_timestamp(reference) - utc_timestamp(timestamp)).total_seconds(), 0.0)
+
+
 class Journal:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -859,9 +894,15 @@ class LiveOrder:
     estimated_spread_cost: float = 0.0
     session_bucket: str = ""
     bar_time: pd.Timestamp | None = None
+    quote_source: str = ""
+    quote_age_seconds: float | None = None
+    fallback_used: bool = False
+    spread_bps_at_submission: float = 0.0
 
     def __post_init__(self) -> None:
         self.remaining_qty = round(max(self.intended_qty - self.filled_qty, 0.0), 8)
+        if self.spread_bps_at_submission == 0.0 and self.expected_spread_bps:
+            self.spread_bps_at_submission = self.expected_spread_bps
 
 
 @dataclass
@@ -947,6 +988,17 @@ class OrderStateMachine:
                 order.estimated_spread_cost + abs(order.avg_fill_price - order.intended_price) * order.filled_qty,
                 6,
             )
+        actual_slippage_bps = None
+        if order.avg_fill_price and order.intended_price > 0:
+            actual_slippage_bps = ((order.avg_fill_price - order.intended_price) / order.intended_price) * 10_000.0
+        metrics_notes = format_note_pairs(
+            quote_source=order.quote_source or None,
+            fallback_used=order.fallback_used if order.quote_source else None,
+            quote_age_seconds=order.quote_age_seconds,
+            spread_bps=order.spread_bps_at_submission if order.quote_source else None,
+            actual_slippage_bps=actual_slippage_bps,
+            broker_rejected=event == "rejected" or bool(order.rejection_reason),
+        )
         self.journal.log(
             {
                 "timestamp": order.last_update_time.isoformat(),
@@ -972,7 +1024,7 @@ class OrderStateMachine:
                 "filled_qty": round(order.filled_qty, 6),
                 "remaining_qty": round(order.remaining_qty, 6),
                 "rejection_reason": order.rejection_reason,
-                "notes": notes,
+                "notes": merge_notes(notes, metrics_notes),
             }
         )
 
@@ -1051,6 +1103,8 @@ class BacktestEngine:
         holding_hours: list[float] = []
         rejected_trade_count = 0
         session_bucket_counts: dict[str, int] = {}
+        quote_source_counts: dict[str, int] = {}
+        fallback_count = 0
         data_sources: dict[str, str] = {}
         data_source_errors: dict[str, str] = {}
 
@@ -1144,6 +1198,7 @@ class BacktestEngine:
                 trades_today += 1
                 bucket = session_bucket(row["timestamp"], self.config)
                 session_bucket_counts[bucket] = session_bucket_counts.get(bucket, 0) + 1
+                quote_source_counts["bar_model"] = quote_source_counts.get("bar_model", 0) + 1
 
             for position in positions:
                 last_row = data.iloc[-1]
@@ -1185,6 +1240,10 @@ class BacktestEngine:
             "data_sources": json.dumps(data_sources, sort_keys=True),
             "data_source_errors": json.dumps(data_source_errors, sort_keys=True),
             "trades_by_session_bucket": json.dumps(session_bucket_counts, sort_keys=True),
+            "quote_source_counts": json.dumps(quote_source_counts, sort_keys=True),
+            "fallback_count": fallback_count,
+            "modeled_spread_bps": self.config.spread_bps,
+            "modeled_slippage_bps": self.config.slippage_bps,
         }
 
     def _manage_open_position(self, position: BacktestPosition, row: pd.Series) -> BacktestPosition | None:
@@ -1284,7 +1343,16 @@ class BacktestEngine:
                 "session_bucket": session_bucket(position.entry_time, self.config),
                 "filled_qty": round(position.qty, 6),
                 "remaining_qty": 0.0,
-                "notes": f"entry={round(position.entry_price, 6)}",
+                "notes": merge_notes(
+                    f"entry={round(position.entry_price, 6)}",
+                    format_note_pairs(
+                        quote_source="bar_model",
+                        fallback_used=False,
+                        quote_age_seconds=0,
+                        spread_bps=self.config.spread_bps,
+                        modeled_slippage_bps=self.config.slippage_bps,
+                    ),
+                ),
             }
         )
 
@@ -1317,6 +1385,10 @@ def print_backtest_summary(result: dict[str, Any]) -> None:
     print(f"Rejected trades: {result['rejected_trade_count']}")
     print(f"Realized reward:risk: {result['realized_reward_to_risk']:.2f}")
     print(f"Trades by session bucket: {result['trades_by_session_bucket']}")
+    print(f"Quote sources: {result.get('quote_source_counts', '{}')}")
+    print(f"Fallback count: {result.get('fallback_count', 0)}")
+    print(f"Modeled spread bps: {float(result.get('modeled_spread_bps', 0.0)):.2f}")
+    print(f"Modeled slippage bps: {float(result.get('modeled_slippage_bps', 0.0)):.2f}")
 
 
 def print_strategy_comparison(frame: pd.DataFrame) -> None:
@@ -1339,6 +1411,10 @@ def print_strategy_comparison(frame: pd.DataFrame) -> None:
                 "realized_reward_to_risk",
                 "data_sources",
                 "trades_by_session_bucket",
+                "quote_source_counts",
+                "fallback_count",
+                "modeled_spread_bps",
+                "modeled_slippage_bps",
             ]
         ].to_string(index=False)
     )
@@ -1589,6 +1665,8 @@ class StreamExecutionEngine:
         self.current_session_day = utc_now().date()
         self.quote_cache: dict[str, StreamQuote] = {}
         self.short_entry_skip_notices: set[tuple[date, str, str]] = set()
+        self.recovery_only_logged_symbols: set[tuple[date, str]] = set()
+        self.last_account_snapshot: tuple[float, float] | None = None
         self._load_local_state()
 
     async def run(self) -> None:
@@ -1731,7 +1809,7 @@ class StreamExecutionEngine:
             return
         if self.broker_state.uncertain:
             self._safe_reconcile()
-        quote = self._stream_quote_snapshot_or_fallback(symbol, signal.entry, signal.bar_time)
+        quote = self._stream_quote_snapshot_or_fallback(symbol, signal.entry, signal.bar_time, "fallback_signal")
         price_reference = float(quote["mid"] or signal.entry)
         capital_base = self._capital_base()
         qty_basis = position_size_from_risk(
@@ -1760,6 +1838,10 @@ class StreamExecutionEngine:
             estimated_spread_cost=estimate_costs(price_reference, qty, float(quote["spread_bps"]), 0.0)[0],
             session_bucket=session_bucket(signal.bar_time, self.config),
             bar_time=signal.bar_time,
+            quote_source=str(quote["quote_source"]),
+            quote_age_seconds=float(quote["quote_age_seconds"]),
+            fallback_used=bool(quote["fallback_used"]),
+            spread_bps_at_submission=float(quote["spread_bps"]),
         )
         self.state_machine.register_intent(order)
         self._persist_local_state()
@@ -1862,7 +1944,7 @@ class StreamExecutionEngine:
         fallback_price = position.avg_entry_price
         if symbol in self.history and not self.history[symbol].empty:
             fallback_price = float(self.history[symbol].iloc[-1]["close"])
-        quote = self._stream_quote_snapshot_or_fallback(symbol, fallback_price, bar_time)
+        quote = self._stream_quote_snapshot_or_fallback(symbol, fallback_price, bar_time, "fallback_bar")
         intended_price = float(quote["mid"] or position.avg_entry_price)
         order = LiveOrder(
             client_order_id=client_order_id,
@@ -1878,6 +1960,10 @@ class StreamExecutionEngine:
             estimated_spread_cost=estimate_costs(intended_price, qty, float(quote["spread_bps"]), 0.0)[0],
             session_bucket=session_bucket(bar_time, self.config),
             bar_time=bar_time,
+            quote_source=str(quote["quote_source"]),
+            quote_age_seconds=float(quote["quote_age_seconds"]),
+            fallback_used=bool(quote["fallback_used"]),
+            spread_bps_at_submission=float(quote["spread_bps"]),
         )
         self.state_machine.register_intent(order)
         self._persist_local_state()
@@ -2040,6 +2126,18 @@ class StreamExecutionEngine:
                 broker_order_id=raw.get("id", ""),
                 entry_exit=entry_exit,
                 last_processed_fill_qty=float(persisted_order.get("last_processed_fill_qty") or persisted_order.get("filled_qty") or 0.0),
+                expected_spread_bps=float(persisted_order.get("expected_spread_bps") or 0.0),
+                estimated_spread_cost=float(persisted_order.get("estimated_spread_cost") or 0.0),
+                session_bucket=str(persisted_order.get("session_bucket") or ""),
+                bar_time=utc_timestamp(persisted_order.get("bar_time")) if persisted_order.get("bar_time") else None,
+                quote_source=str(persisted_order.get("quote_source") or ""),
+                quote_age_seconds=(
+                    float(persisted_order.get("quote_age_seconds"))
+                    if persisted_order.get("quote_age_seconds") not in (None, "")
+                    else None
+                ),
+                fallback_used=parse_bool(persisted_order.get("fallback_used"), False),
+                spread_bps_at_submission=float(persisted_order.get("spread_bps_at_submission") or persisted_order.get("expected_spread_bps") or 0.0),
             )
             rebuilt_orders.append(order)
             rebuilt_order_ids.add(client_order_id)
@@ -2079,7 +2177,7 @@ class StreamExecutionEngine:
                 rebuilt_orders,
             )
             recovery_only = stop_price <= 0 or initial_risk <= 0
-            rebuilt_positions[raw["symbol"]] = LivePosition(
+            position = LivePosition(
                 symbol=symbol,
                 strategy=str(strategy_name),
                 side=side,
@@ -2093,6 +2191,9 @@ class StreamExecutionEngine:
                 recovery_only=recovery_only,
                 available_qty=normalize_qty(self.config.asset_class, available_qty),
             )
+            rebuilt_positions[raw["symbol"]] = position
+            if recovery_only:
+                self._log_recovery_only_position(position)
             daily_unrealized_pnl += float(raw.get("unrealized_pl") or 0.0)
         self.broker_state.positions = rebuilt_positions
         self.broker_state.open_orders_by_symbol = open_orders_by_symbol
@@ -2114,6 +2215,7 @@ class StreamExecutionEngine:
         capital_base = self.broker_state.account_equity or self.config.starting_capital
         self.broker_state.kill_switch_active = combined_loss >= (capital_base * self.config.max_daily_loss)
         self.broker_state.uncertain = False
+        self._log_account_snapshot_if_changed()
         self._persist_local_state()
 
     def _validate_live_config(self) -> None:
@@ -2327,9 +2429,18 @@ class StreamExecutionEngine:
             "ask": quote.ask,
             "spread_bps": quote.spread_bps,
             "timestamp": quote.timestamp,
+            "quote_source": "stream",
+            "quote_age_seconds": quote_age_seconds(quote.timestamp),
+            "fallback_used": False,
         }
 
-    def _stream_quote_snapshot_or_fallback(self, symbol: str, fallback_price: float, fallback_time: pd.Timestamp) -> dict[str, Any]:
+    def _stream_quote_snapshot_or_fallback(
+        self,
+        symbol: str,
+        fallback_price: float,
+        fallback_time: pd.Timestamp,
+        fallback_source: str = "fallback_signal",
+    ) -> dict[str, Any]:
         quote = self._stream_quote_snapshot(symbol)
         if quote is not None:
             return quote
@@ -2340,6 +2451,9 @@ class StreamExecutionEngine:
             "ask": fallback,
             "spread_bps": 0.0,
             "timestamp": utc_timestamp(fallback_time),
+            "quote_source": fallback_source,
+            "quote_age_seconds": 0.0,
+            "fallback_used": True,
         }
 
     def _refresh_quote_cache(self) -> bool:
@@ -2400,6 +2514,7 @@ class StreamExecutionEngine:
             self.current_session_day = session_day
             self.broker_state.daily_realized_pnl = 0.0
             self.broker_state.kill_switch_active = False
+            self.recovery_only_logged_symbols.clear()
             self._persist_local_state()
 
     def _safe_reconcile(self) -> None:
@@ -2442,6 +2557,10 @@ class StreamExecutionEngine:
                 session_bucket=str(payload.get("session_bucket") or ""),
                 bar_time=utc_timestamp(payload.get("bar_time")) if payload.get("bar_time") else None,
                 last_processed_fill_qty=last_processed,
+                quote_source=str(payload.get("quote_source") or ""),
+                quote_age_seconds=float(payload.get("quote_age_seconds")) if payload.get("quote_age_seconds") not in (None, "") else None,
+                fallback_used=parse_bool(payload.get("fallback_used"), False),
+                spread_bps_at_submission=float(payload.get("spread_bps_at_submission") or payload.get("expected_spread_bps") or 0.0),
             )
         except Exception:
             return None
@@ -2474,6 +2593,86 @@ class StreamExecutionEngine:
             if derived_risk > 0:
                 return order.stop_price, derived_risk, order.strategy, order.last_update_time
         return stop_price, initial_risk, strategy_name, entry_time
+
+    def _log_recovery_only_position(self, position: LivePosition) -> None:
+        key = (self.current_session_day, position.symbol)
+        if key in self.recovery_only_logged_symbols:
+            return
+        self.recovery_only_logged_symbols.add(key)
+        self.journal.log(
+            {
+                "timestamp": utc_now().isoformat(),
+                "symbol": position.symbol,
+                "strategy": position.strategy,
+                "side": position.side,
+                "mode": self.config.mode,
+                "event": "recovery_only",
+                "entry_exit": "state",
+                "stop": round(position.stop_price, 6) if position.stop_price else "",
+                "size": round(position.qty, 6),
+                "signal_price": "",
+                "intended_price": "",
+                "fill_price": round(position.avg_entry_price, 6) if position.avg_entry_price else "",
+                "slippage": "",
+                "spread_cost": "",
+                "execution_cost": "",
+                "pnl": "",
+                "r_multiple": "",
+                "session_bucket": session_bucket(utc_now(), self.config),
+                "order_status": "",
+                "filled_qty": "",
+                "remaining_qty": "",
+                "rejection_reason": "",
+                "notes": format_note_pairs(
+                    position_state="recovery_only",
+                    reason="missing_stop_or_risk_metadata",
+                    stop_price=position.stop_price,
+                    initial_risk_per_unit=position.initial_risk_per_unit,
+                ),
+            }
+        )
+
+    def _log_account_snapshot_if_changed(self) -> None:
+        snapshot = (
+            round(self.broker_state.daily_realized_pnl, 6),
+            round(self.broker_state.daily_unrealized_pnl, 6),
+        )
+        if snapshot == self.last_account_snapshot:
+            return
+        self.last_account_snapshot = snapshot
+        self.journal.log(
+            {
+                "timestamp": utc_now().isoformat(),
+                "symbol": "",
+                "strategy": self.config.strategy,
+                "side": "",
+                "mode": self.config.mode,
+                "event": "account_snapshot",
+                "entry_exit": "account",
+                "stop": "",
+                "size": "",
+                "signal_price": "",
+                "intended_price": "",
+                "fill_price": "",
+                "slippage": "",
+                "spread_cost": "",
+                "execution_cost": "",
+                "pnl": "",
+                "r_multiple": "",
+                "session_bucket": session_bucket(utc_now(), self.config),
+                "client_order_id": "",
+                "order_status": "",
+                "filled_qty": "",
+                "remaining_qty": "",
+                "rejection_reason": "",
+                "notes": format_note_pairs(
+                    daily_realized_pnl=self.broker_state.daily_realized_pnl,
+                    daily_unrealized_pnl=self.broker_state.daily_unrealized_pnl,
+                    account_equity=self.broker_state.account_equity,
+                    buying_power=self.broker_state.buying_power,
+                ),
+            }
+        )
 
     def _load_local_state(self) -> None:
         state = self._read_state_file()
@@ -2518,6 +2717,10 @@ class StreamExecutionEngine:
                 "estimated_spread_cost": order.estimated_spread_cost,
                 "session_bucket": order.session_bucket,
                 "bar_time": order.bar_time.isoformat() if order.bar_time is not None else "",
+                "quote_source": order.quote_source,
+                "quote_age_seconds": order.quote_age_seconds,
+                "fallback_used": order.fallback_used,
+                "spread_bps_at_submission": order.spread_bps_at_submission,
             }
         serialized_positions: dict[str, Any] = {}
         for symbol, position in self.broker_state.positions.items():
