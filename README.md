@@ -72,7 +72,7 @@ Notes:
 - For paper trading, use `https://paper-api.alpaca.markets`
 - For live trading, use `https://api.alpaca.markets`
 - Live mode is additionally gated by `ALLOW_LIVE=true`
-- Optional overrides include `MODE`, `SYMBOLS`, `ASSET_CLASS`, `ALLOW_SHORT`, `RISK_PER_TRADE`, `SLIPPAGE_BPS`, `SPREAD_BPS`, and `TIMEFRAME`
+- Optional overrides include `MODE`, `SYMBOLS`, `ASSET_CLASS`, `ALLOW_SHORT`, `RISK_PROFILE`, `RISK_PER_TRADE`, `CAPITAL_DEPLOYMENT_FRACTION`, `MAX_DAILY_LOSS`, `SLIPPAGE_BPS`, `SPREAD_BPS`, `TIMEFRAME`, `JOURNAL_PATH`, `STATE_PATH`, `RUN_ID`, and `STRICT_DATA`
 
 ## Default Configuration
 
@@ -98,6 +98,11 @@ Current defaults:
 - Max gross exposure: `$3,000`
 
 To change defaults, edit the `Config` dataclass directly.
+
+Risk profiles:
+
+- `conservative`: current default sizing posture, using equity as the sizing budget.
+- `aggressive_margin`: sets `risk_per_trade=1.0`, `capital_deployment_fraction=1.0`, and `max_daily_loss=1.0`; paper/live sizing uses Alpaca `buying_power`, while backtests use the configured gross exposure budget.
 
 ## Strategy Logic
 
@@ -177,6 +182,9 @@ Current comparison metrics:
 - realized reward:risk
 - data sources
 - trades by session bucket
+- quote source counts
+- max buying power used
+- synthetic data warning when fallback data was used
 
 ### 3. Paper trade with Alpaca
 
@@ -284,6 +292,12 @@ Available flags:
 - `--symbols SYMBOL [SYMBOL ...]`
 - `--capital FLOAT`
 - `--timeframe VALUE`
+- `--risk-profile {aggressive_margin,conservative}`
+- `--capital-deployment-fraction FLOAT`
+- `--max-daily-loss FLOAT`
+- `--journal-path PATH`
+- `--state-path PATH`
+- `--strict-data`
 - `--show-plan`
 
 ## Safety Notes
@@ -294,10 +308,11 @@ Available flags:
 - `scheduled_live` also requires `ALLOW_LIVE=true`
 - paper mode requires `ALPACA_BASE_URL=https://paper-api.alpaca.markets`
 - live mode requires `ALPACA_BASE_URL=https://api.alpaca.markets`
-- position sizing is capped by available account equity
+- conservative position sizing is capped by available account equity
+- `aggressive_margin` can use Alpaca buying power and can lose the full deployed capital
 - the current execution path submits market orders only
 - short logic exists in the backtest and signal engine and still requires `ALLOW_SHORT=true` to generate short signals
-- paper/live no longer skip entries locally for spread, stale quotes, cooldowns, exposure caps, recovery flags, account shorting metadata, or buying-power estimates; Alpaca accepts or rejects submitted market orders
+- paper/live only block hard technical failures locally; Alpaca remains the source of truth for buying power, shorting, and final order acceptance
 - broker-side order rejections include Alpaca HTTP status, request ID, and response body in `rejection_reason`
 
 ## Limitations
@@ -306,3 +321,4 @@ Available flags:
 - no portfolio optimizer or advanced framework
 - scheduling depends on Alpaca market calendar access and falls back to weekday assumptions if the calendar endpoint is unavailable
 - offline backtests may use synthetic sample data if no local CSV or Alpaca credentials are available
+- use `--strict-data` for performance claims so missing market data fails instead of falling back to synthetic sample data

@@ -60,16 +60,45 @@ SCHEDULED_MODE_MAP: dict[str, str] = {
 TRUTHY_VALUES = {"1", "true", "yes", "y", "on"}
 FALSY_VALUES = {"0", "false", "no", "n", "off"}
 
+RISK_PROFILES = {"conservative", "aggressive_margin"}
+
+ACTIVE_ORDER_STATUSES = {
+    "new",
+    "pending_new",
+    "accepted",
+    "accepted_for_bidding",
+    "partially_filled",
+    "pending_replace",
+    "pending_cancel",
+    "held",
+    "stopped",
+    "suspended",
+    "pending_reconcile",
+}
+
+TERMINAL_ORDER_STATUSES = {
+    "filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "done_for_day",
+    "rejected",
+    "replaced",
+    "calculated",
+}
+
+KNOWN_ORDER_STATUSES = ACTIVE_ORDER_STATUSES | TERMINAL_ORDER_STATUSES
+
 
 ORDER_TRANSITIONS: dict[str, set[str]] = {
-    "new": {"accepted", "partially_filled", "filled", "canceled", "rejected", "pending_reconcile"},
-    "pending_reconcile": {"accepted", "partially_filled", "filled", "canceled", "rejected", "pending_reconcile"},
-    "accepted": {"partially_filled", "filled", "canceled", "rejected"},
-    "partially_filled": {"partially_filled", "filled", "canceled", "rejected"},
-    "filled": set(),
-    "canceled": set(),
-    "rejected": set(),
+    status: set(KNOWN_ORDER_STATUSES) for status in ACTIVE_ORDER_STATUSES
 }
+ORDER_TRANSITIONS.update({status: set() for status in TERMINAL_ORDER_STATUSES})
+
+
+def new_run_id() -> str:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"run-{stamp}-{random.randint(0, 999999):06d}"
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -123,6 +152,7 @@ class Config:
     mode: str = "backtest"
     asset_class: str = "equity"
     strategy: str = "momentum"
+    risk_profile: str = "conservative"
     symbols: list[str] = field(
         default_factory=lambda: [
             "TQQQ",
@@ -146,6 +176,7 @@ class Config:
     lookback_days: int = 30
     starting_capital: float = 1_000.0
     risk_per_trade: float = 0.05
+    capital_deployment_fraction: float = 1.0
     max_daily_loss: float = 0.10
     max_trades_per_day: int = 4
     max_open_positions: int = 3
@@ -168,7 +199,9 @@ class Config:
     compare_output_path: str = "strategy_comparison.csv"
     journal_path: str = "trade_journal.csv"
     state_path: str = "live_state.json"
+    run_id: str = field(default_factory=new_run_id)
     data_dir: str = "data"
+    strict_data: bool = False
     session_start_hour_utc: int = 13
     session_end_hour_utc: int = 20
     paper_feed: str = "iex"
@@ -213,7 +246,10 @@ class Config:
             alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", ""),
             alpaca_base_url=os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
             asset_class=os.getenv("ASSET_CLASS", "equity"),
+            risk_profile=os.getenv("RISK_PROFILE", "conservative"),
+            run_id=os.getenv("RUN_ID", new_run_id()),
         )
+        config.apply_risk_profile_defaults()
         if os.getenv("SYMBOLS"):
             config.symbols = [s.strip() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
         if os.getenv("MODE"):
@@ -222,13 +258,31 @@ class Config:
             config.allow_short = parse_bool(os.getenv("ALLOW_SHORT"), config.allow_short)
         if os.getenv("RISK_PER_TRADE"):
             config.risk_per_trade = float(os.getenv("RISK_PER_TRADE", config.risk_per_trade))
+        if os.getenv("CAPITAL_DEPLOYMENT_FRACTION"):
+            config.capital_deployment_fraction = float(os.getenv("CAPITAL_DEPLOYMENT_FRACTION", config.capital_deployment_fraction))
+        if os.getenv("MAX_DAILY_LOSS"):
+            config.max_daily_loss = float(os.getenv("MAX_DAILY_LOSS", config.max_daily_loss))
         if os.getenv("SLIPPAGE_BPS"):
             config.slippage_bps = float(os.getenv("SLIPPAGE_BPS", config.slippage_bps))
         if os.getenv("SPREAD_BPS"):
             config.spread_bps = float(os.getenv("SPREAD_BPS", config.spread_bps))
         if os.getenv("TIMEFRAME"):
             config.timeframe = os.getenv("TIMEFRAME", config.timeframe)
+        if os.getenv("JOURNAL_PATH"):
+            config.journal_path = os.getenv("JOURNAL_PATH", config.journal_path)
+        if os.getenv("STATE_PATH"):
+            config.state_path = os.getenv("STATE_PATH", config.state_path)
+        if os.getenv("STRICT_DATA"):
+            config.strict_data = parse_bool(os.getenv("STRICT_DATA"), config.strict_data)
         return config
+
+    def apply_risk_profile_defaults(self) -> None:
+        if self.risk_profile not in RISK_PROFILES:
+            raise ValueError(f"Unsupported risk profile: {self.risk_profile}")
+        if self.risk_profile == "aggressive_margin":
+            self.risk_per_trade = 1.0
+            self.capital_deployment_fraction = 1.0
+            self.max_daily_loss = 1.0
 
 
 def utc_now() -> pd.Timestamp:
@@ -241,6 +295,29 @@ def execution_mode(mode: str) -> str:
 
 def is_scheduled_mode(mode: str) -> bool:
     return mode in SCHEDULED_MODE_MAP
+
+
+def normalize_order_status(status: Any) -> str:
+    normalized = _enum_value(status).strip().lower()
+    if normalized == "cancelled":
+        return "canceled"
+    return normalized or "accepted"
+
+
+def is_active_order_status(status: str) -> bool:
+    return normalize_order_status(status) in ACTIVE_ORDER_STATUSES
+
+
+def uses_aggressive_margin(config: Config) -> bool:
+    return config.risk_profile == "aggressive_margin"
+
+
+def buying_power_budget(config: Config, equity: float, buying_power: float = 0.0) -> float:
+    if uses_aggressive_margin(config):
+        if execution_mode(config.mode) in {"paper", "live"} and buying_power > 0:
+            return buying_power * config.capital_deployment_fraction
+        return max(config.max_gross_exposure, equity * config.capital_deployment_fraction)
+    return equity * config.capital_deployment_fraction
 
 
 def parse_timeframe(timeframe: str) -> tuple[int, str]:
@@ -383,6 +460,81 @@ def estimate_costs(price: float, qty: float, spread_bps: float, slippage_bps: fl
     return spread_cost, slippage_cost
 
 
+def modeled_entry_fill_price(side: str, price: float, config: Config) -> float:
+    spread_half = price * (config.spread_bps / 20_000.0)
+    slip = price * (config.slippage_bps / 10_000.0)
+    return price + spread_half + slip if side == "buy" else price - spread_half - slip
+
+
+def modeled_exit_fill_price(position_side: str, price: float, config: Config) -> float:
+    spread_half = price * (config.spread_bps / 20_000.0)
+    slip = price * (config.slippage_bps / 10_000.0)
+    return price - spread_half - slip if position_side == "buy" else price + spread_half + slip
+
+
+def fill_event_from_snapshot(client_order_id: str, snapshot: dict[str, Any], rejection_reason: str = "") -> FillEvent:
+    status = normalize_order_status(snapshot.get("status", "accepted"))
+    return FillEvent(
+        client_order_id=client_order_id,
+        status=status,
+        filled_qty=float(snapshot.get("filled_qty") or 0.0),
+        avg_fill_price=float(snapshot.get("filled_avg_price") or 0.0),
+        broker_order_id=str(snapshot.get("id", "") or ""),
+        rejection_reason=rejection_reason if status == "rejected" else "",
+        timestamp=utc_now(),
+    )
+
+
+def build_trade_intent(
+    config: Config,
+    mode: str,
+    signal: Signal,
+    quote: dict[str, Any],
+    capital_base: float,
+) -> TradeIntent | None:
+    price_reference = float(quote.get("mid") or signal.entry)
+    qty_basis = position_size_from_risk(
+        capital_base,
+        price_reference,
+        signal.stop,
+        config.risk_per_trade,
+    )
+    qty = normalize_qty(config.asset_class, qty_basis)
+    if qty <= 0:
+        return None
+    client_order_id = deterministic_client_order_id(
+        execution_mode(mode),
+        signal.strategy,
+        signal.symbol,
+        signal.side,
+        "entry",
+        signal.bar_time,
+    )
+    return TradeIntent(
+        signal=signal,
+        qty=qty,
+        price_reference=price_reference,
+        quote=quote,
+        client_order_id=client_order_id,
+        capital_base=capital_base,
+    )
+
+
+def live_position_from_backtest(position: BacktestPosition) -> LivePosition:
+    return LivePosition(
+        symbol=position.symbol,
+        strategy=position.strategy,
+        side=position.side,
+        qty=position.open_qty,
+        avg_entry_price=position.entry_price,
+        stop_price=position.stop_price,
+        initial_risk_per_unit=position.initial_risk_per_unit,
+        entry_time=position.entry_time,
+        partial_taken=position.partial_taken,
+        available_qty=position.open_qty,
+    )
+
+
 def within_session(ts: pd.Timestamp, config: Config) -> bool:
     if config.asset_class == "crypto":
         return True
@@ -471,9 +623,11 @@ def quote_age_seconds(timestamp: pd.Timestamp | None, now: pd.Timestamp | None =
 
 
 class Journal:
-    def __init__(self, path: str):
+    def __init__(self, path: str, run_id: str = ""):
         self.path = Path(path)
+        self.run_id = run_id
         self.fields = [
+            "run_id",
             "timestamp",
             "symbol",
             "strategy",
@@ -503,12 +657,34 @@ class Journal:
             with self.path.open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=self.fields)
                 writer.writeheader()
+        else:
+            self._ensure_schema()
 
     def log(self, row: dict[str, Any]) -> None:
         payload = {field: row.get(field, "") for field in self.fields}
+        if self.run_id and not payload.get("run_id"):
+            payload["run_id"] = self.run_id
         with self.path.open("a", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=self.fields)
             writer.writerow(payload)
+
+    def _ensure_schema(self) -> None:
+        try:
+            with self.path.open(newline="") as handle:
+                reader = csv.DictReader(handle)
+                existing_fields = reader.fieldnames or []
+                if existing_fields == self.fields:
+                    return
+                if all(field in existing_fields for field in self.fields):
+                    return
+                rows = list(reader)
+            with self.path.open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=self.fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({field: row.get(field, "") for field in self.fields})
+        except Exception:
+            return
 
 
 def add_indicators(df: pd.DataFrame, config: Config) -> pd.DataFrame:
@@ -565,6 +741,9 @@ class DataLoader:
                 return self._prepare_with_source(fetched, symbol, "alpaca")
         except Exception as exc:
             fetch_error = f"{type(exc).__name__}: {exc}"
+        if self.config.strict_data:
+            detail = f" Alpaca fetch failed: {fetch_error}" if fetch_error else " No local CSV was found and Alpaca data was unavailable."
+            raise RuntimeError(f"Strict data mode refused synthetic sample data for {symbol} ({self.config.timeframe}).{detail}")
         fallback = self._prepare_with_source(self._generate_sample_data(symbol), symbol, "synthetic_sample")
         fallback.attrs["source_error"] = fetch_error
         warning = f"Warning: using synthetic sample data for {symbol} ({self.config.timeframe})."
@@ -922,6 +1101,62 @@ class LivePosition:
     available_qty: float | None = None
 
 
+@dataclass
+class TradeIntent:
+    signal: Signal
+    qty: float
+    price_reference: float
+    quote: dict[str, Any]
+    client_order_id: str
+    capital_base: float
+
+
+@dataclass
+class ExitIntent:
+    symbol: str
+    side: str
+    qty: float
+    reason: str
+    price_reference: float
+    quote: dict[str, Any]
+    client_order_id: str
+    bar_time: pd.Timestamp
+
+
+@dataclass
+class FillEvent:
+    client_order_id: str
+    status: str
+    filled_qty: float
+    avg_fill_price: float
+    broker_order_id: str = ""
+    rejection_reason: str = ""
+    timestamp: pd.Timestamp = field(default_factory=utc_now)
+
+
+class BrokerAdapter(ABC):
+    @abstractmethod
+    def submit_entry(self, intent: TradeIntent) -> FillEvent:
+        raise NotImplementedError
+
+    @abstractmethod
+    def submit_exit(self, intent: ExitIntent, position: LivePosition) -> FillEvent:
+        raise NotImplementedError
+
+
+class AlpacaBrokerAdapter(BrokerAdapter):
+    def __init__(self, executor: BaseExecutor):
+        self.executor = executor
+
+    def submit_entry(self, intent: TradeIntent) -> FillEvent:
+        snapshot = self.executor.submit_entry_order(intent.signal, intent.qty, intent.client_order_id)
+        return fill_event_from_snapshot(intent.client_order_id, snapshot)
+
+    def submit_exit(self, intent: ExitIntent, position: LivePosition) -> FillEvent:
+        snapshot = self.executor.submit_exit_order(position, intent.qty, intent.client_order_id, intent.reason)
+        return fill_event_from_snapshot(intent.client_order_id, snapshot)
+
+
 class OrderStateMachine:
     def __init__(self, journal: Journal, mode: str):
         self.orders: dict[str, LiveOrder] = {}
@@ -945,7 +1180,8 @@ class OrderStateMachine:
         if client_order_id not in self.orders:
             raise KeyError(f"Unknown client_order_id: {client_order_id}")
         order = self.orders[client_order_id]
-        status = status.lower()
+        status = normalize_order_status(status)
+        order.status = normalize_order_status(order.status)
         if status not in ORDER_TRANSITIONS:
             raise ValueError(f"Unsupported order status: {status}")
         if status != order.status and status not in ORDER_TRANSITIONS[order.status]:
@@ -963,12 +1199,7 @@ class OrderStateMachine:
 
     def has_open_order(self, symbol: str, side: str, entry_exit: str) -> bool:
         for order in self.orders.values():
-            if order.symbol == symbol and order.side == side and order.entry_exit == entry_exit and order.status in {
-                "new",
-                "pending_reconcile",
-                "accepted",
-                "partially_filled",
-            }:
+            if order.symbol == symbol and order.side == side and order.entry_exit == entry_exit and is_active_order_status(order.status):
                 return True
         return False
 
@@ -977,7 +1208,7 @@ class OrderStateMachine:
         for order in open_orders:
             retained[order.client_order_id] = order
         for client_order_id, existing in list(self.orders.items()):
-            if existing.status in {"filled", "canceled", "rejected", "pending_reconcile"}:
+            if not is_active_order_status(existing.status) or existing.status == "pending_reconcile":
                 retained.setdefault(client_order_id, existing)
         self.orders = retained
 
@@ -1083,6 +1314,31 @@ class BacktestPosition:
     exit_slippage: float = 0.0
 
 
+class SimulatedBrokerAdapter(BrokerAdapter):
+    def __init__(self, config: Config):
+        self.config = config
+
+    def submit_entry(self, intent: TradeIntent) -> FillEvent:
+        fill_price = modeled_entry_fill_price(intent.signal.side, intent.price_reference, self.config)
+        return FillEvent(
+            client_order_id=intent.client_order_id,
+            status="filled",
+            filled_qty=intent.qty,
+            avg_fill_price=fill_price,
+            broker_order_id=f"sim-{intent.client_order_id}",
+        )
+
+    def submit_exit(self, intent: ExitIntent, position: LivePosition) -> FillEvent:
+        fill_price = modeled_exit_fill_price(position.side, intent.price_reference, self.config)
+        return FillEvent(
+            client_order_id=intent.client_order_id,
+            status="filled",
+            filled_qty=intent.qty,
+            avg_fill_price=fill_price,
+            broker_order_id=f"sim-{intent.client_order_id}",
+        )
+
+
 class BacktestEngine:
     def __init__(self, config: Config, journal: Journal):
         self.config = config
@@ -1090,11 +1346,9 @@ class BacktestEngine:
 
     def run(self) -> dict[str, Any]:
         strategy = STRATEGIES[self.config.strategy]
+        broker = SimulatedBrokerAdapter(self.config)
         equity = self.config.starting_capital
-        daily_loss = 0.0
-        trades_today = 0
-        current_day: date | None = None
-        positions: list[BacktestPosition] = []
+        positions: dict[str, BacktestPosition] = {}
         trade_pnls: list[float] = []
         r_multiples: list[float] = []
         equity_points: list[dict[str, Any]] = []
@@ -1107,110 +1361,132 @@ class BacktestEngine:
         fallback_count = 0
         data_sources: dict[str, str] = {}
         data_source_errors: dict[str, str] = {}
+        data_by_symbol: dict[str, pd.DataFrame] = {}
+        timeline: list[tuple[pd.Timestamp, str, int]] = []
+        daily_loss_by_day: dict[date, float] = {}
+        trades_by_day: dict[date, int] = {}
+        max_buying_power_used = 0.0
 
         for symbol in self.config.symbols:
             data = DataLoader(self.config).load_historical_data(symbol)
             data_sources[symbol] = str(data.attrs.get("data_source", "unknown"))
+            if data_sources[symbol] == "synthetic_sample":
+                fallback_count += 1
             source_error = str(data.attrs.get("source_error", "")).strip()
             if source_error:
                 data_source_errors[symbol] = source_error
-            positions = []
-            current_day = None
-            daily_loss = 0.0
-            trades_today = 0
+            data_by_symbol[symbol] = data
+            for i, row in data.iterrows():
+                timeline.append((utc_timestamp(row["timestamp"]), symbol, int(i)))
 
-            for i in range(1, len(data)):
-                history = data.iloc[: i + 1]
-                row = history.iloc[-1]
-                day = row["timestamp"].date()
-                if current_day != day:
-                    current_day = day
-                    daily_loss = 0.0
-                    trades_today = 0
+        for _, symbol, i in sorted(timeline, key=lambda item: (item[0], item[1])):
+            data = data_by_symbol[symbol]
+            history = data.iloc[: i + 1]
+            row = history.iloc[-1]
+            day = row["timestamp"].date()
 
-                next_positions: list[BacktestPosition] = []
-                for position in positions:
-                    closed = self._manage_open_position(position, row)
-                    if closed is not None:
-                        equity += closed.pnl
-                        daily_loss += min(closed.pnl, 0.0)
-                        trade_pnls.append(closed.pnl)
-                        r_multiples.append(closed.r_multiple)
-                        spread_costs.append(closed.estimated_spread_cost + closed.exit_spread_cost)
-                        slippages.append(closed.estimated_entry_slippage + closed.exit_slippage)
-                        if closed.exit_time is not None:
-                            holding_hours.append((closed.exit_time - closed.entry_time).total_seconds() / 3600.0)
-                        self._journal_trade(closed)
-                    else:
-                        next_positions.append(position)
-                positions = next_positions
+            position = positions.get(symbol)
+            if position is not None:
+                closed = self._manage_open_position(position, row)
+                if closed is not None:
+                    equity += closed.pnl
+                    daily_loss_by_day[day] = daily_loss_by_day.get(day, 0.0) + min(closed.pnl, 0.0)
+                    trade_pnls.append(closed.pnl)
+                    r_multiples.append(closed.r_multiple)
+                    spread_costs.append(closed.estimated_spread_cost + closed.exit_spread_cost)
+                    slippages.append(closed.estimated_entry_slippage + closed.exit_slippage)
+                    if closed.exit_time is not None:
+                        holding_hours.append((closed.exit_time - closed.entry_time).total_seconds() / 3600.0)
+                    self._journal_trade(closed)
+                    del positions[symbol]
 
-                equity_points.append({"timestamp": row["timestamp"], "equity": equity})
-                if trades_today >= self.config.max_trades_per_day:
+            equity_points.append({"timestamp": row["timestamp"], "equity": equity})
+            if i < 1 or symbol in positions:
+                continue
+            if not uses_aggressive_margin(self.config):
+                if trades_by_day.get(day, 0) >= self.config.max_trades_per_day:
                     continue
-                if abs(daily_loss) >= equity * self.config.max_daily_loss:
+                if abs(daily_loss_by_day.get(day, 0.0)) >= equity * self.config.max_daily_loss:
                     continue
-                symbol_positions = [position for position in positions if position.symbol == symbol and position.strategy == self.config.strategy]
-                if len(symbol_positions) >= 1:
+                if len(positions) >= self.config.max_open_positions:
                     continue
 
-                signal = strategy.generate_signal(symbol, history, self.config, self.config.spread_bps)
-                if signal is None:
-                    continue
+            signal = strategy.generate_signal(symbol, history, self.config, self.config.spread_bps)
+            if signal is None:
+                continue
 
-                reserved_capital = sum(position.open_qty * position.entry_price for position in positions)
-                available_capital = max(equity - reserved_capital, 0.0)
-                qty_basis = position_size_from_risk(
-                    available_capital,
-                    signal.entry,
-                    signal.stop,
-                    self.config.risk_per_trade,
-                )
-                qty = normalize_qty(self.config.asset_class, qty_basis)
-                if qty <= 0:
-                    rejected_trade_count += 1
-                    continue
+            reserved_capital = sum(position.open_qty * position.entry_price for position in positions.values())
+            capital_budget = buying_power_budget(self.config, equity)
+            available_capital = max(capital_budget - reserved_capital, 0.0)
+            quote = {
+                "mid": signal.entry,
+                "bid": signal.entry,
+                "ask": signal.entry,
+                "spread_bps": self.config.spread_bps,
+                "timestamp": signal.bar_time,
+                "quote_source": "bar_model",
+                "quote_age_seconds": 0.0,
+                "fallback_used": False,
+            }
+            intent = build_trade_intent(self.config, self.config.mode, signal, quote, available_capital)
+            if intent is None:
+                rejected_trade_count += 1
+                continue
 
-                spread_half = signal.entry * (self.config.spread_bps / 20_000.0)
-                slip = signal.entry * (self.config.slippage_bps / 10_000.0)
-                if signal.side == "buy":
-                    entry_fill = signal.entry + spread_half + slip
-                else:
-                    entry_fill = signal.entry - spread_half - slip
-                spread_cost, entry_slippage = estimate_costs(signal.entry, qty, self.config.spread_bps, self.config.slippage_bps)
-                positions.append(
-                    BacktestPosition(
-                        symbol=symbol,
-                        strategy=self.config.strategy,
-                        side=signal.side,
-                        entry_time=row["timestamp"],
-                        entry_price=entry_fill,
-                        signal_price=signal.entry,
-                        stop_price=signal.stop,
-                        initial_stop_price=signal.stop,
-                        qty=qty,
-                        open_qty=qty,
-                        initial_risk_per_unit=abs(entry_fill - signal.stop),
-                        estimated_spread_cost=spread_cost,
-                        estimated_entry_slippage=entry_slippage,
-                    )
-                )
-                trades_today += 1
-                bucket = session_bucket(row["timestamp"], self.config)
-                session_bucket_counts[bucket] = session_bucket_counts.get(bucket, 0) + 1
-                quote_source_counts["bar_model"] = quote_source_counts.get("bar_model", 0) + 1
+            fill = broker.submit_entry(intent)
+            if fill.status != "filled" or fill.filled_qty <= 0:
+                rejected_trade_count += 1
+                continue
 
-            for position in positions:
-                last_row = data.iloc[-1]
-                closed = self._close_position(position, last_row["timestamp"], float(last_row["close"]), "end_of_data")
-                equity += closed.pnl
-                trade_pnls.append(closed.pnl)
-                r_multiples.append(closed.r_multiple)
-                spread_costs.append(closed.estimated_spread_cost + closed.exit_spread_cost)
-                slippages.append(closed.estimated_entry_slippage + closed.exit_slippage)
-                if closed.exit_time is not None:
-                    holding_hours.append((closed.exit_time - closed.entry_time).total_seconds() / 3600.0)
-                self._journal_trade(closed)
+            spread_cost, entry_slippage = estimate_costs(
+                intent.price_reference,
+                fill.filled_qty,
+                self.config.spread_bps,
+                self.config.slippage_bps,
+            )
+            positions[symbol] = BacktestPosition(
+                symbol=symbol,
+                strategy=self.config.strategy,
+                side=signal.side,
+                entry_time=row["timestamp"],
+                entry_price=fill.avg_fill_price,
+                signal_price=signal.entry,
+                stop_price=signal.stop,
+                initial_stop_price=signal.stop,
+                qty=fill.filled_qty,
+                open_qty=fill.filled_qty,
+                initial_risk_per_unit=abs(fill.avg_fill_price - signal.stop),
+                estimated_spread_cost=spread_cost,
+                estimated_entry_slippage=entry_slippage,
+            )
+            trades_by_day[day] = trades_by_day.get(day, 0) + 1
+            bucket = session_bucket(row["timestamp"], self.config)
+            session_bucket_counts[bucket] = session_bucket_counts.get(bucket, 0) + 1
+            quote_source_counts["bar_model"] = quote_source_counts.get("bar_model", 0) + 1
+            max_buying_power_used = max(
+                max_buying_power_used,
+                sum(position.open_qty * position.entry_price for position in positions.values()),
+            )
+
+        for position in list(positions.values()):
+            data = data_by_symbol[position.symbol]
+            last_row = data.iloc[-1]
+            closed = self._close_position(position, last_row["timestamp"], float(last_row["close"]), "end_of_data")
+            equity += closed.pnl
+            trade_pnls.append(closed.pnl)
+            r_multiples.append(closed.r_multiple)
+            spread_costs.append(closed.estimated_spread_cost + closed.exit_spread_cost)
+            slippages.append(closed.estimated_entry_slippage + closed.exit_slippage)
+            if closed.exit_time is not None:
+                holding_hours.append((closed.exit_time - closed.entry_time).total_seconds() / 3600.0)
+            self._journal_trade(closed)
+
+        synthetic_data_used = any(source == "synthetic_sample" for source in data_sources.values())
+        performance_warning = (
+            "synthetic_data_used: performance is not reliable without local CSV or Alpaca historical data"
+            if synthetic_data_used
+            else ""
+        )
 
         equity_curve = pd.DataFrame(equity_points)
         equity_series = equity_curve["equity"] if not equity_curve.empty else pd.Series([self.config.starting_capital], dtype="float64")
@@ -1244,6 +1520,11 @@ class BacktestEngine:
             "fallback_count": fallback_count,
             "modeled_spread_bps": self.config.spread_bps,
             "modeled_slippage_bps": self.config.slippage_bps,
+            "risk_profile": self.config.risk_profile,
+            "capital_deployment_fraction": self.config.capital_deployment_fraction,
+            "max_buying_power_used": round(max_buying_power_used, 2),
+            "synthetic_data_used": synthetic_data_used,
+            "performance_warning": performance_warning,
         }
 
     def _manage_open_position(self, position: BacktestPosition, row: pd.Series) -> BacktestPosition | None:
@@ -1259,19 +1540,21 @@ class BacktestEngine:
         )
 
         if position.side == "buy":
-            if row["low"] <= position.stop_price:
-                return self._close_position(position, row["timestamp"], float(position.stop_price), "stop_loss")
             if not position.partial_taken and row["high"] >= target_1:
-                self._take_partial(position, target_1)
+                self._take_partial(position, float(row["close"]))
+                return None
+            if row["low"] <= position.stop_price:
+                return self._close_position(position, row["timestamp"], float(row["close"]), "stop_loss")
             if row["high"] >= target_2 or row["close"] < row["ema_fast"]:
-                return self._close_position(position, row["timestamp"], float(min(target_2, row["close"])), "target_or_structure")
+                return self._close_position(position, row["timestamp"], float(row["close"]), "target_or_structure")
         else:
-            if row["high"] >= position.stop_price:
-                return self._close_position(position, row["timestamp"], float(position.stop_price), "stop_loss")
             if not position.partial_taken and row["low"] <= target_1:
-                self._take_partial(position, target_1)
+                self._take_partial(position, float(row["close"]))
+                return None
+            if row["high"] >= position.stop_price:
+                return self._close_position(position, row["timestamp"], float(row["close"]), "stop_loss")
             if row["low"] <= target_2 or row["close"] > row["ema_fast"]:
-                return self._close_position(position, row["timestamp"], float(max(target_2, row["close"])), "target_or_structure")
+                return self._close_position(position, row["timestamp"], float(row["close"]), "target_or_structure")
         return None
 
     def _take_partial(self, position: BacktestPosition, target_price: float) -> None:
@@ -1294,12 +1577,7 @@ class BacktestEngine:
         exit_price: float,
         reason: str,
     ) -> BacktestPosition:
-        spread_half = exit_price * (self.config.spread_bps / 20_000.0)
-        slip = exit_price * (self.config.slippage_bps / 10_000.0)
-        if position.side == "buy":
-            fill = exit_price - spread_half - slip
-        else:
-            fill = exit_price + spread_half + slip
+        fill = modeled_exit_fill_price(position.side, exit_price, self.config)
         direction = 1 if position.side == "buy" else -1
         gross_pnl = (fill - position.entry_price) * position.open_qty * direction
         exit_spread_cost, exit_slippage = estimate_costs(exit_price, position.open_qty, self.config.spread_bps, self.config.slippage_bps)
@@ -1351,6 +1629,7 @@ class BacktestEngine:
                         quote_age_seconds=0,
                         spread_bps=self.config.spread_bps,
                         modeled_slippage_bps=self.config.slippage_bps,
+                        execution_model="closed_bar_market",
                     ),
                 ),
             }
@@ -1358,7 +1637,8 @@ class BacktestEngine:
 
 
 def compare_strategies(config: Config) -> pd.DataFrame:
-    journal = Journal(f"{Path(config.journal_path).stem}_momentum.csv")
+    journal_path = Path(config.journal_path)
+    journal = Journal(str(journal_path.with_name(f"{journal_path.stem}_momentum{journal_path.suffix or '.csv'}")), config.run_id)
     results = [BacktestEngine(config, journal).run()]
     frame = pd.DataFrame(results)
     if not frame.empty:
@@ -1369,10 +1649,14 @@ def compare_strategies(config: Config) -> pd.DataFrame:
 
 def print_backtest_summary(result: dict[str, Any]) -> None:
     print(f"Strategy: {result['strategy']}")
+    print(f"Risk profile: {result.get('risk_profile', 'conservative')}")
     print(f"Data sources: {result.get('data_sources', '{}')}")
     data_source_errors = result.get("data_source_errors")
     if data_source_errors and data_source_errors != "{}":
         print(f"Data source errors: {data_source_errors}")
+    performance_warning = result.get("performance_warning")
+    if performance_warning:
+        print(f"Performance warning: {performance_warning}")
     print(f"Ending equity: ${result['ending_equity']:.2f}")
     print(f"Total return: {result['total_return']:.2f}%")
     print(f"Win rate: {result['win_rate']:.2f}%")
@@ -1389,6 +1673,7 @@ def print_backtest_summary(result: dict[str, Any]) -> None:
     print(f"Fallback count: {result.get('fallback_count', 0)}")
     print(f"Modeled spread bps: {float(result.get('modeled_spread_bps', 0.0)):.2f}")
     print(f"Modeled slippage bps: {float(result.get('modeled_slippage_bps', 0.0)):.2f}")
+    print(f"Max buying power used: ${float(result.get('max_buying_power_used', 0.0)):.2f}")
 
 
 def print_strategy_comparison(frame: pd.DataFrame) -> None:
@@ -1399,6 +1684,7 @@ def print_strategy_comparison(frame: pd.DataFrame) -> None:
         frame[
             [
                 "strategy",
+                "risk_profile",
                 "total_return",
                 "win_rate",
                 "average_r",
@@ -1415,6 +1701,8 @@ def print_strategy_comparison(frame: pd.DataFrame) -> None:
                 "fallback_count",
                 "modeled_spread_bps",
                 "modeled_slippage_bps",
+                "max_buying_power_used",
+                "synthetic_data_used",
             ]
         ].to_string(index=False)
     )
@@ -1657,6 +1945,7 @@ class StreamExecutionEngine:
         self.aggregator = StreamBarAggregator(config)
         self.history: dict[str, pd.DataFrame] = {}
         self.executor: BaseExecutor = EquitiesExecutor(config) if config.asset_class == "equity" else CryptoExecutor(config)
+        self.broker_adapter: BrokerAdapter = AlpacaBrokerAdapter(self.executor)
         self.trading_client: TradingClient | None = None
         self.state_path = Path(self.config.state_path)
         self.last_market_data_time: pd.Timestamp | None = None
@@ -1807,35 +2096,31 @@ class StreamExecutionEngine:
         signal = self.strategy.generate_signal(symbol, self.history[symbol], self.config, self.config.spread_bps)
         if signal is None:
             return
-        if self.broker_state.uncertain:
-            self._safe_reconcile()
-        quote = self._stream_quote_snapshot_or_fallback(symbol, signal.entry, signal.bar_time, "fallback_signal")
-        price_reference = float(quote["mid"] or signal.entry)
-        capital_base = self._capital_base()
-        qty_basis = position_size_from_risk(
-            capital_base,
-            price_reference,
-            signal.stop,
-            self.config.risk_per_trade,
-        )
-        qty = normalize_qty(self.config.asset_class, qty_basis)
-        if qty <= 0:
+        if self.broker_state.uncertain and not self._safe_reconcile():
             return
-        client_order_id = deterministic_client_order_id(execution_mode(self.config.mode), signal.strategy, symbol, signal.side, "entry", signal.bar_time)
-        if client_order_id in self.state_machine.orders and self.state_machine.orders[client_order_id].status in {"new", "accepted", "partially_filled", "filled"}:
+        quote = self._stream_quote_snapshot_or_fallback(symbol, signal.entry, signal.bar_time, "fallback_signal")
+        intent = build_trade_intent(self.config, self.config.mode, signal, quote, self._capital_base())
+        if intent is None:
+            return
+        if intent.client_order_id in self.state_machine.orders and (
+            is_active_order_status(self.state_machine.orders[intent.client_order_id].status)
+            or self.state_machine.orders[intent.client_order_id].status == "filled"
+        ):
+            return
+        if not self._entry_risk_checks(symbol, signal.side, intent.price_reference, intent.qty, quote):
             return
         order = LiveOrder(
-            client_order_id=client_order_id,
+            client_order_id=intent.client_order_id,
             symbol=symbol,
             strategy=signal.strategy,
             side=signal.side,
-            intended_qty=qty,
-            intended_price=price_reference,
+            intended_qty=intent.qty,
+            intended_price=intent.price_reference,
             signal_price=signal.entry,
             stop_price=signal.stop,
             entry_exit="entry",
             expected_spread_bps=float(quote["spread_bps"]),
-            estimated_spread_cost=estimate_costs(price_reference, qty, float(quote["spread_bps"]), 0.0)[0],
+            estimated_spread_cost=estimate_costs(intent.price_reference, intent.qty, float(quote["spread_bps"]), 0.0)[0],
             session_bucket=session_bucket(signal.bar_time, self.config),
             bar_time=signal.bar_time,
             quote_source=str(quote["quote_source"]),
@@ -1847,14 +2132,16 @@ class StreamExecutionEngine:
         self._persist_local_state()
         await self._submit_order_with_retry(
             order=order,
-            submitter=lambda: self.executor.submit_entry_order(signal, qty, client_order_id),
+            submitter=lambda: self._broker_adapter().submit_entry(intent),
         )
 
     async def flatten_for_session_close(self, reason: str = "scheduled_close") -> None:
         self.broker_state.kill_switch_active = True
-        self._safe_reconcile()
+        if not self._safe_reconcile():
+            return
         self._cancel_open_orders()
-        self._safe_reconcile()
+        if not self._safe_reconcile():
+            return
         for symbol, position in list(self.broker_state.positions.items()):
             if self.state_machine.has_open_order(symbol, "sell" if position.side == "buy" else "buy", "exit"):
                 continue
@@ -1874,9 +2161,10 @@ class StreamExecutionEngine:
             await self._submit_exit(symbol, position, position.qty, reason, bar_time)
 
     def _cancel_open_orders(self) -> None:
-        self._safe_reconcile()
+        if not self._safe_reconcile():
+            return
         for order in list(self.state_machine.orders.values()):
-            if order.status not in {"new", "pending_reconcile", "accepted", "partially_filled"}:
+            if not is_active_order_status(order.status):
                 continue
             if not order.broker_order_id:
                 continue
@@ -1925,8 +2213,8 @@ class StreamExecutionEngine:
         qty = normalize_qty(self.config.asset_class, qty)
         if qty <= 0:
             return
-        if self.broker_state.uncertain:
-            self._safe_reconcile()
+        if self.broker_state.uncertain and not self._safe_reconcile():
+            return
         available_qty = self._available_exit_qty(symbol)
         qty = normalize_qty(self.config.asset_class, min(qty, available_qty))
         if qty <= 0:
@@ -1939,13 +2227,26 @@ class StreamExecutionEngine:
             f"exit_{reason}",
             bar_time,
         )
-        if client_order_id in self.state_machine.orders and self.state_machine.orders[client_order_id].status in {"new", "accepted", "partially_filled", "filled"}:
+        if client_order_id in self.state_machine.orders and (
+            is_active_order_status(self.state_machine.orders[client_order_id].status)
+            or self.state_machine.orders[client_order_id].status == "filled"
+        ):
             return
         fallback_price = position.avg_entry_price
         if symbol in self.history and not self.history[symbol].empty:
             fallback_price = float(self.history[symbol].iloc[-1]["close"])
         quote = self._stream_quote_snapshot_or_fallback(symbol, fallback_price, bar_time, "fallback_bar")
         intended_price = float(quote["mid"] or position.avg_entry_price)
+        intent = ExitIntent(
+            symbol=symbol,
+            side=exit_side,
+            qty=qty,
+            reason=reason,
+            price_reference=intended_price,
+            quote=quote,
+            client_order_id=client_order_id,
+            bar_time=bar_time,
+        )
         order = LiveOrder(
             client_order_id=client_order_id,
             symbol=symbol,
@@ -1969,7 +2270,7 @@ class StreamExecutionEngine:
         self._persist_local_state()
         await self._submit_order_with_retry(
             order=order,
-            submitter=lambda: self.executor.submit_exit_order(position, qty, client_order_id, reason),
+            submitter=lambda: self._broker_adapter().submit_exit(intent, position),
         )
 
     async def _on_trade_update(self, update: Any) -> None:
@@ -1985,14 +2286,25 @@ class StreamExecutionEngine:
         avg_fill_price = float(_enum_value(getattr(order, "filled_avg_price", 0.0)) or 0.0)
         status_map = {
             "new": "new",
+            "pending_new": "pending_new",
             "accepted": "accepted",
+            "accepted_for_bidding": "accepted_for_bidding",
             "partially_filled": "partially_filled",
             "fill": "filled",
             "filled": "filled",
+            "done_for_day": "done_for_day",
             "canceled": "canceled",
+            "cancelled": "canceled",
+            "expired": "expired",
+            "replaced": "replaced",
+            "pending_cancel": "pending_cancel",
+            "pending_replace": "pending_replace",
+            "stopped": "stopped",
+            "suspended": "suspended",
+            "calculated": "calculated",
             "rejected": "rejected",
         }
-        status = status_map.get(str(event).lower(), _enum_value(getattr(order, "status", "accepted")).lower())
+        status = normalize_order_status(status_map.get(str(event).lower(), getattr(order, "status", "accepted")))
         tracked = self.state_machine.apply_update(
             client_order_id=client_order_id,
             status=status,
@@ -2004,6 +2316,11 @@ class StreamExecutionEngine:
         )
         self._rebuild_position_from_fills(tracked)
         self._persist_local_state()
+
+    def _broker_adapter(self) -> BrokerAdapter:
+        if isinstance(self.broker_adapter, AlpacaBrokerAdapter) and self.broker_adapter.executor is not self.executor:
+            self.broker_adapter = AlpacaBrokerAdapter(self.executor)
+        return self.broker_adapter
 
     def _rebuild_position_from_fills(self, order: LiveOrder) -> None:
         fill_delta = order.last_fill_delta
@@ -2120,7 +2437,7 @@ class StreamExecutionEngine:
                 intended_price=intended_price,
                 signal_price=float(persisted_order.get("signal_price") or intended_price or 0.0),
                 stop_price=stop_price,
-                status=str(raw.get("status", "accepted")).lower(),
+                status=normalize_order_status(raw.get("status", "accepted")),
                 filled_qty=float(raw.get("filled_qty") or 0.0),
                 avg_fill_price=float(raw.get("filled_avg_price") or 0.0),
                 broker_order_id=raw.get("id", ""),
@@ -2264,11 +2581,16 @@ class StreamExecutionEngine:
         attempts = 0
         last_retryable_http_error = ""
         while attempts <= self.config.max_submit_retries:
+            retry_exc: Any = None
             try:
                 response = submitter()
-                self._apply_broker_order_snapshot(order, response)
+                if isinstance(response, FillEvent):
+                    self._apply_fill_event(order, response)
+                else:
+                    self._apply_broker_order_snapshot(order, response)
                 return
             except requests.HTTPError as exc:
+                retry_exc = exc
                 status_code = exc.response.status_code if exc.response is not None else 0
                 formatted_error = format_http_error(exc)
                 if 400 <= status_code < 500 and status_code != 429:
@@ -2284,11 +2606,13 @@ class StreamExecutionEngine:
                         rejection_reason=formatted_error,
                         timestamp=utc_now(),
                     )
+                    self._set_cooldown_for_rejection(order.symbol, formatted_error)
                     self._persist_local_state()
                     return
                 last_retryable_http_error = formatted_error
                 attempts += 1
             except (requests.Timeout, requests.ConnectionError):
+                retry_exc = None
                 self.state_machine.apply_update(
                     client_order_id=order.client_order_id,
                     status="pending_reconcile",
@@ -2304,6 +2628,7 @@ class StreamExecutionEngine:
                     return
                 attempts += 1
             except Exception as exc:
+                retry_exc = None
                 attempts += 1
                 if attempts > self.config.max_submit_retries:
                     self.state_machine.apply_update(
@@ -2318,7 +2643,7 @@ class StreamExecutionEngine:
                     return
 
             if attempts <= self.config.max_submit_retries:
-                await asyncio.sleep(min(self.config.reconnect_backoff_seconds * attempts, self.config.reconnect_backoff_max_seconds))
+                await asyncio.sleep(self._submit_retry_delay(attempts, retry_exc))
         self.state_machine.apply_update(
             client_order_id=order.client_order_id,
             status="rejected",
@@ -2333,30 +2658,64 @@ class StreamExecutionEngine:
         )
         self._persist_local_state()
 
-    def _apply_broker_order_snapshot(self, order: LiveOrder, snapshot: dict[str, Any], rejection_reason: str = "") -> LiveOrder:
-        status = str(snapshot.get("status", "accepted")).lower()
+    def _submit_retry_delay(self, attempt: int, exc: Any = None) -> float:
+        retry_after = None
+        response = getattr(exc, "response", None)
+        if response is not None:
+            raw_retry_after = response.headers.get("Retry-After") or response.headers.get("retry-after")
+            try:
+                retry_after = float(raw_retry_after) if raw_retry_after else None
+            except ValueError:
+                retry_after = None
+        backoff = min(self.config.reconnect_backoff_seconds * max(attempt, 1), self.config.reconnect_backoff_max_seconds)
+        return max(retry_after or 0.0, backoff)
+
+    def _set_cooldown_for_rejection(self, symbol: str, rejection_reason: str) -> None:
+        reason = rejection_reason.lower()
+        if any(token in reason for token in ("shorting disabled", "insufficient buying power", "cannot be shorted")):
+            self._set_symbol_cooldown(symbol, self.config.cooldown_minutes_after_rejection)
+
+    def _apply_fill_event(self, order: LiveOrder, fill: FillEvent) -> LiveOrder:
         tracked = self.state_machine.apply_update(
             client_order_id=order.client_order_id,
-            status=status,
-            filled_qty=float(snapshot.get("filled_qty") or 0.0),
-            avg_fill_price=float(snapshot.get("filled_avg_price") or 0.0),
-            broker_order_id=snapshot.get("id", ""),
-            rejection_reason=rejection_reason if status == "rejected" else "",
-            timestamp=utc_now(),
+            status=fill.status,
+            filled_qty=fill.filled_qty,
+            avg_fill_price=fill.avg_fill_price,
+            broker_order_id=fill.broker_order_id,
+            rejection_reason=fill.rejection_reason,
+            timestamp=fill.timestamp,
         )
+        if fill.status == "rejected" and fill.rejection_reason:
+            self._set_cooldown_for_rejection(order.symbol, fill.rejection_reason)
         self._rebuild_position_from_fills(tracked)
         self._persist_local_state()
         return tracked
 
+    def _apply_broker_order_snapshot(self, order: LiveOrder, snapshot: dict[str, Any], rejection_reason: str = "") -> LiveOrder:
+        fill = fill_event_from_snapshot(order.client_order_id, snapshot, rejection_reason)
+        return self._apply_fill_event(order, fill)
+
     def _lookup_broker_order(self, client_order_id: str) -> dict[str, Any] | None:
+        headers = {
+            "APCA-API-KEY-ID": self.config.alpaca_api_key,
+            "APCA-API-SECRET-KEY": self.config.alpaca_secret_key,
+        }
+        try:
+            response = requests.get(
+                f"{self.config.alpaca_base_url}/v2/orders:by_client_order_id",
+                headers=headers,
+                params={"client_order_id": client_order_id},
+                timeout=15,
+            )
+            if response.status_code == 200:
+                return response.json()
+        except Exception:
+            pass
         try:
             after = (datetime.now(UTC) - timedelta(minutes=self.config.recent_order_lookup_minutes)).isoformat()
             response = requests.get(
                 f"{self.config.alpaca_base_url}/v2/orders",
-                headers={
-                    "APCA-API-KEY-ID": self.config.alpaca_api_key,
-                    "APCA-API-SECRET-KEY": self.config.alpaca_secret_key,
-                },
+                headers=headers,
                 params={"status": "all", "nested": "false", "limit": 500, "after": after},
                 timeout=15,
             )
@@ -2369,6 +2728,14 @@ class StreamExecutionEngine:
         return None
 
     def _entry_risk_checks(self, symbol: str, side: str, price_reference: float, qty: float, quote: dict[str, Any]) -> bool:
+        if not self._can_trade_symbol(symbol):
+            return False
+        if side not in {"buy", "sell"}:
+            return False
+        if price_reference <= 0 or qty <= 0:
+            return False
+        if self.config.asset_class not in {"equity", "crypto"}:
+            return False
         return True
 
     def _skip_short_entry(self, symbol: str, reason: str, detail: str) -> bool:
@@ -2386,7 +2753,7 @@ class StreamExecutionEngine:
         for order in self.state_machine.orders.values():
             if order.symbol != symbol or order.strategy != strategy_name or order.entry_exit != "entry":
                 continue
-            if order.status in {"new", "pending_reconcile", "accepted", "partially_filled"}:
+            if is_active_order_status(order.status):
                 layers += 1
         return layers
 
@@ -2416,7 +2783,8 @@ class StreamExecutionEngine:
 
     def _capital_base(self) -> float:
         if execution_mode(self.config.mode) in {"paper", "live"}:
-            return self.broker_state.account_equity or self.config.starting_capital
+            equity = self.broker_state.account_equity or self.config.starting_capital
+            return buying_power_budget(self.config, equity, self.broker_state.buying_power)
         return self.config.starting_capital
 
     def _stream_quote_snapshot(self, symbol: str) -> dict[str, Any] | None:
@@ -2483,7 +2851,7 @@ class StreamExecutionEngine:
         reserved_notional_by_symbol: dict[str, float] = {}
         reserved_exit_qty_by_symbol: dict[str, float] = {}
         for order in self.state_machine.orders.values():
-            if order.status not in {"new", "pending_reconcile", "accepted", "partially_filled"}:
+            if not is_active_order_status(order.status):
                 continue
             if order.entry_exit == "exit":
                 reserved_exit_qty_by_symbol[order.symbol] = reserved_exit_qty_by_symbol.get(order.symbol, 0.0) + order.remaining_qty
@@ -2495,10 +2863,10 @@ class StreamExecutionEngine:
         self.broker_state.reserved_exit_qty_by_symbol = reserved_exit_qty_by_symbol
 
     def _can_trade_symbol(self, symbol: str) -> bool:
-        return True
+        return bool(symbol and symbol.strip())
 
     def _has_active_orders(self) -> bool:
-        return any(order.status in {"new", "pending_reconcile", "accepted", "partially_filled"} for order in self.state_machine.orders.values())
+        return any(is_active_order_status(order.status) for order in self.state_machine.orders.values())
 
     def _expects_live_market_data(self, now: pd.Timestamp) -> bool:
         if self.config.asset_class == "crypto":
@@ -2517,12 +2885,15 @@ class StreamExecutionEngine:
             self.recovery_only_logged_symbols.clear()
             self._persist_local_state()
 
-    def _safe_reconcile(self) -> None:
+    def _safe_reconcile(self) -> bool:
         try:
             self.reconcile_state()
             self._persist_local_state()
+            return True
         except Exception as exc:
+            self.broker_state.uncertain = True
             print(f"Reconciliation failed: {exc}")
+            return False
 
     def _read_state_file(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -2545,7 +2916,7 @@ class StreamExecutionEngine:
                 intended_price=float(payload["intended_price"]),
                 signal_price=float(payload["signal_price"]),
                 stop_price=float(payload.get("stop_price") or 0.0),
-                status=str(payload.get("status") or "new"),
+                status=normalize_order_status(payload.get("status") or "new"),
                 filled_qty=filled_qty,
                 avg_fill_price=float(payload.get("avg_fill_price") or 0.0),
                 last_update_time=utc_timestamp(payload.get("last_update_time")) if payload.get("last_update_time") else utc_now(),
@@ -2887,11 +3258,11 @@ class TradingBot:
             print_strategy_comparison(frame)
             return
         if execution_mode(self.config.mode) == "backtest":
-            journal = Journal(self.config.journal_path)
+            journal = Journal(self.config.journal_path, self.config.run_id)
             result = BacktestEngine(self.config, journal).run()
             print_backtest_summary(result)
             return
-        journal = Journal(self.config.journal_path)
+        journal = Journal(self.config.journal_path, self.config.run_id)
         if is_scheduled_mode(self.config.mode):
             self._run_async(ScheduledSessionRunner(self.config, journal).run())
             return
@@ -2906,6 +3277,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", nargs="+", help="Override watchlist symbols.")
     parser.add_argument("--capital", type=float, help="Override starting capital.")
     parser.add_argument("--timeframe", default=None, help="Override timeframe such as 5Min or 15Min.")
+    parser.add_argument("--risk-profile", choices=sorted(RISK_PROFILES), default=None)
+    parser.add_argument("--capital-deployment-fraction", type=float, default=None)
+    parser.add_argument("--max-daily-loss", type=float, default=None)
+    parser.add_argument("--journal-path", default=None)
+    parser.add_argument("--state-path", default=None)
+    parser.add_argument("--strict-data", action="store_true", help="Refuse synthetic sample data in backtests.")
     parser.add_argument("--show-plan", action="store_true", help="Print the short implementation plan before running.")
     return parser.parse_args()
 
@@ -2916,12 +3293,25 @@ def main() -> None:
     config.mode = args.mode
     if args.asset_class:
         config.asset_class = args.asset_class
+    if args.risk_profile:
+        config.risk_profile = args.risk_profile
+        config.apply_risk_profile_defaults()
     if args.symbols:
         config.symbols = args.symbols
     if args.capital:
         config.starting_capital = args.capital
     if args.timeframe:
         config.timeframe = args.timeframe
+    if args.capital_deployment_fraction is not None:
+        config.capital_deployment_fraction = args.capital_deployment_fraction
+    if args.max_daily_loss is not None:
+        config.max_daily_loss = args.max_daily_loss
+    if args.journal_path:
+        config.journal_path = args.journal_path
+    if args.state_path:
+        config.state_path = args.state_path
+    if args.strict_data:
+        config.strict_data = True
     TradingBot(config).run(compare=args.compare, show_plan=args.show_plan)
 
 

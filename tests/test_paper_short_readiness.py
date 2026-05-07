@@ -6,13 +6,13 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pandas as pd
 import requests
 
 import microcapital_trader as trader
-from microcapital_trader import BacktestEngine, Config, Journal, LiveOrder, LivePosition, Signal, StreamExecutionEngine, StreamQuote, format_http_error, utc_now
+from microcapital_trader import BacktestEngine, Config, DataLoader, Journal, LiveOrder, LivePosition, Signal, StreamExecutionEngine, StreamQuote, format_http_error, utc_now
 
 
 def journal_rows(path: str) -> list[dict[str, str]]:
@@ -379,6 +379,42 @@ class SubmitFillReconciliationTests(unittest.TestCase):
         rejected_row = next(row for row in journal_rows(engine.config.journal_path) if row["event"] == "rejected")
         self.assertIn("HTTP 403 Forbidden", rejected_row["rejection_reason"])
         self.assertIn("broker_rejected=true", rejected_row["notes"])
+        self.assertIn("AAPL", engine.broker_state.cooldowns)
+
+    def test_429_retry_respects_retry_after_then_recovers_fill(self) -> None:
+        engine = self.make_engine()
+        order = self.make_order()
+        engine.state_machine.register_intent(order)
+        response = requests.Response()
+        response.status_code = 429
+        response.reason = "Too Many Requests"
+        response.headers["Retry-After"] = "7"
+        response._content = b'{"message":"rate limited"}'
+        exc = requests.HTTPError("429 Client Error", response=response)
+        attempts = {"count": 0}
+
+        def submitter() -> dict[str, str]:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise exc
+            return {"status": "filled", "filled_qty": "5", "filled_avg_price": "101", "id": "broker-1"}
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            asyncio.run(engine._submit_order_with_retry(order, submitter))
+
+        self.assertEqual(2, attempts["count"])
+        sleep_mock.assert_awaited_once_with(7.0)
+        self.assertEqual("filled", engine.state_machine.orders[order.client_order_id].status)
+
+    def test_expanded_order_statuses_are_supported(self) -> None:
+        engine = self.make_engine()
+        order = self.make_order()
+        engine.state_machine.register_intent(order)
+
+        engine.state_machine.apply_update(order.client_order_id, "pending_new", 0.0, 0.0)
+        tracked = engine.state_machine.apply_update(order.client_order_id, "done_for_day", 0.0, 0.0)
+
+        self.assertEqual("done_for_day", tracked.status)
 
 
 class ExitSubmissionSizingTests(unittest.TestCase):
@@ -651,6 +687,70 @@ class BacktestMetricsTests(unittest.TestCase):
         self.assertIn("quote_age_seconds=0", trade_row["notes"])
         self.assertIn("spread_bps=7.0", trade_row["notes"])
         self.assertIn("modeled_slippage_bps=3.0", trade_row["notes"])
+
+
+class AggressiveBacktestParityTests(unittest.TestCase):
+    class TwoSymbolSignalStrategy:
+        def generate_signal(self, symbol: str, history: pd.DataFrame, config: Config, estimated_spread_bps: float) -> Signal | None:
+            if len(history) != 2:
+                return None
+            return Signal(
+                strategy="parity_test",
+                symbol=symbol,
+                side="buy",
+                entry=100.0,
+                stop=95.0,
+                target_1=105.0,
+                target_2=110.0,
+                reason="test_signal",
+                bar_time=history.iloc[-1]["timestamp"],
+            )
+
+    def make_data(self, symbol: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {"timestamp": pd.Timestamp("2026-05-06T14:30:00Z"), "open": 99.0, "high": 101.0, "low": 98.0, "close": 100.0, "volume": 1000, "ema_fast": 90.0, "symbol": symbol},
+                {"timestamp": pd.Timestamp("2026-05-06T14:45:00Z"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1200, "ema_fast": 90.0, "symbol": symbol},
+                {"timestamp": pd.Timestamp("2026-05-06T15:00:00Z"), "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1300, "ema_fast": 90.0, "symbol": symbol},
+            ]
+        )
+
+    def test_chronological_backtest_uses_margin_budget_across_symbols(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(
+            mode="backtest",
+            strategy="parity_test",
+            risk_profile="aggressive_margin",
+            asset_class="equity",
+            symbols=["AAA", "BBB"],
+            starting_capital=1000.0,
+            max_gross_exposure=3000.0,
+            risk_per_trade=0.01,
+            journal_path=str(root / "journal.csv"),
+            state_path=str(root / "state.json"),
+        )
+
+        with patch.dict(trader.STRATEGIES, {"parity_test": self.TwoSymbolSignalStrategy()}):
+            with patch("microcapital_trader.DataLoader.load_historical_data", side_effect=lambda symbol: self.make_data(symbol)):
+                result = BacktestEngine(config, Journal(config.journal_path)).run()
+
+        self.assertEqual(2, result["trade_count"])
+        self.assertEqual("aggressive_margin", result["risk_profile"])
+        self.assertGreater(result["max_buying_power_used"], config.starting_capital)
+        rows = [row for row in journal_rows(config.journal_path) if row["entry_exit"] == "round_trip"]
+        self.assertEqual({"AAA", "BBB"}, {row["symbol"] for row in rows})
+        self.assertTrue(all("execution_model=closed_bar_market" in row["notes"] for row in rows))
+
+    def test_strict_data_refuses_synthetic_fallback(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name)
+        config = Config(symbols=["NOLOCAL"], data_dir=str(root / "missing"), strict_data=True)
+
+        with self.assertRaisesRegex(RuntimeError, "Strict data mode refused synthetic"):
+            DataLoader(config).load_historical_data("NOLOCAL")
 
 
 class LiveConfigValidationTests(unittest.TestCase):
