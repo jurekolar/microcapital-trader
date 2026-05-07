@@ -7,6 +7,7 @@ Lightweight momentum trading bot for small accounts, built around a single Pytho
 The current version supports:
 
 - Momentum backtesting
+- Guarded return optimization
 - One-strategy comparison output for momentum
 - Alpaca paper trading
 - Alpaca live trading
@@ -32,6 +33,7 @@ The script has been smoke-tested locally with:
 - `trade_journal.csv`: created automatically when trades or order events are logged
 - `trade_journal_momentum.csv`: created automatically during compare runs
 - `strategy_comparison.csv`: created automatically by compare mode
+- `optimization_results.csv`: created automatically by optimize mode
 - `live_state.json`: local live/paper order and position state
 - `data/<SYMBOL>_<TIMEFRAME>.csv`: optional local historical data input
 
@@ -186,7 +188,23 @@ Current comparison metrics:
 - max buying power used
 - synthetic data warning when fallback data was used
 
-### 3. Paper trade with Alpaca
+### 3. Run guarded return optimization
+
+```bash
+.venv/bin/python microcapital_trader.py --mode optimize --strict-data
+```
+
+Optimize mode writes `optimization_results.csv` and ranks candidate rows using guardrails:
+
+- no synthetic data
+- max drawdown no worse than `-6%`
+- at least `15` trades
+- current, prior, and combined validation windows
+- aggressive margin is included but flagged as high risk
+
+The default candidate set tests the current default symbols, recent-drag removals, top-contributor baskets, the old `AAPL AMD MSFT` control, long-only versus long/short, `15Min` / `30Min` / `1Hour` / `5Min`, and conservative versus aggressive-margin risk profiles.
+
+### 4. Paper trade with Alpaca
 
 Set `.env` to paper API credentials and paper base URL, then run:
 
@@ -200,7 +218,7 @@ Example:
 .venv/bin/python microcapital_trader.py --mode paper --symbols AAPL MSFT
 ```
 
-### 4. Live trade with Alpaca
+### 5. Live trade with Alpaca
 
 Live mode is intentionally separated and blocked unless `ALLOW_LIVE=true` is set.
 
@@ -218,7 +236,7 @@ ALPACA_BASE_URL=https://api.alpaca.markets
 ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode live --symbols AAPL
 ```
 
-### 5. Scheduled paper session
+### 6. Scheduled paper session
 
 The scheduled modes wait until the configured pre-open window, start the stream engine automatically, flatten positions shortly before the close, and exit after the close.
 
@@ -226,7 +244,7 @@ The scheduled modes wait until the configured pre-open window, start the stream 
 .venv/bin/python microcapital_trader.py --mode scheduled_paper
 ```
 
-### 6. Scheduled live session
+### 7. Scheduled live session
 
 ```bash
 ALLOW_LIVE=true .venv/bin/python microcapital_trader.py --mode scheduled_live
@@ -286,17 +304,20 @@ Compare mode prints the same momentum metrics and writes one row to `strategy_co
 
 Available flags:
 
-- `--mode {backtest,paper,live,scheduled_paper,scheduled_live}`
+- `--mode {backtest,optimize,paper,live,scheduled_paper,scheduled_live}`
 - `--asset-class {equity,crypto}`
 - `--compare`
 - `--symbols SYMBOL [SYMBOL ...]`
 - `--capital FLOAT`
 - `--timeframe VALUE`
+- `--lookback-days INT`
+- `--historical-end TIMESTAMP`
 - `--risk-profile {aggressive_margin,conservative}`
 - `--capital-deployment-fraction FLOAT`
 - `--max-daily-loss FLOAT`
 - `--journal-path PATH`
 - `--state-path PATH`
+- `--optimization-output-path PATH`
 - `--strict-data`
 - `--show-plan`
 
@@ -318,7 +339,7 @@ Available flags:
 ## Limitations
 
 - single-script implementation by design
-- no portfolio optimizer or advanced framework
+- optimize mode is a guarded candidate runner, not an advanced portfolio optimizer
 - scheduling depends on Alpaca market calendar access and falls back to weekday assumptions if the calendar endpoint is unavailable
 - offline backtests may use synthetic sample data if no local CSV or Alpaca credentials are available
 - use `--strict-data` for performance claims so missing market data fails instead of falling back to synthetic sample data

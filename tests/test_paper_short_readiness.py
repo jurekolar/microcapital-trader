@@ -12,7 +12,23 @@ import pandas as pd
 import requests
 
 import microcapital_trader as trader
-from microcapital_trader import BacktestEngine, Config, DataLoader, Journal, LiveOrder, LivePosition, Signal, StreamExecutionEngine, StreamQuote, format_http_error, utc_now
+from microcapital_trader import (
+    BacktestEngine,
+    Config,
+    DataLoader,
+    Journal,
+    LiveOrder,
+    LivePosition,
+    OptimizationWindow,
+    Signal,
+    StreamExecutionEngine,
+    StreamQuote,
+    SymbolBasket,
+    VWAPMomentumBreakoutStrategy,
+    format_http_error,
+    optimize_for_total_return,
+    utc_now,
+)
 
 
 def journal_rows(path: str) -> list[dict[str, str]]:
@@ -45,6 +61,112 @@ class HttpErrorFormattingTests(unittest.TestCase):
         formatted = format_http_error(exc)
 
         self.assertEqual("HTTP 500 Internal Server Error body=first line second line", formatted)
+
+
+class MomentumSignalRobustnessTests(unittest.TestCase):
+    def test_signal_skips_rows_with_pd_na_boolean_inputs(self) -> None:
+        config = Config(allow_short=True)
+        history = pd.DataFrame(
+            [
+                {
+                    "timestamp": pd.Timestamp("2026-05-06T14:45:00Z"),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 98.0,
+                    "volume": 1000,
+                    "ema_fast": 97.0,
+                    "ema_slow": 99.0,
+                    "vwap": 100.0,
+                    "recent_high": 101.0,
+                    "recent_low": 99.0,
+                    "rvol": 2.0,
+                    "strong_close": 0.2,
+                    "weak_close": pd.NA,
+                }
+            ]
+        )
+
+        signal = VWAPMomentumBreakoutStrategy().generate_signal("AAPL", history, config, estimated_spread_bps=4.0)
+
+        self.assertIsNone(signal)
+
+
+class OptimizationRunnerTests(unittest.TestCase):
+    def test_optimizer_writes_guarded_ranked_results(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        output_path = str(Path(temp_dir.name) / "optimization_results.csv")
+        config = Config(
+            mode="optimize",
+            symbols=["AAA", "BBB"],
+            optimization_output_path=output_path,
+        )
+        baskets = [SymbolBasket("baseline_default", ("AAA", "BBB"))]
+        windows = [
+            OptimizationWindow("current_30d", 30, "2026-05-07T00:00:00+00:00"),
+            OptimizationWindow("prior_30d", 30, "2026-04-07T00:00:00+00:00"),
+        ]
+
+        def fake_run(engine: BacktestEngine) -> dict[str, object]:
+            total_return = 12.0 if not engine.config.allow_short else 5.0
+            return {
+                "strategy": "momentum",
+                "ending_equity": 1000.0 + total_return,
+                "total_return": total_return,
+                "win_rate": 55.0 if not engine.config.allow_short else 45.0,
+                "average_r": 0.4 if not engine.config.allow_short else 0.1,
+                "max_drawdown": -3.0,
+                "trade_count": 20,
+                "avg_slippage": 0.0,
+                "avg_spread_cost": 0.0,
+                "avg_holding_time_hours": 1.0,
+                "rejected_trade_count": 1,
+                "realized_reward_to_risk": 1.5,
+                "data_sources": "{}",
+                "data_source_errors": "{}",
+                "trades_by_session_bucket": "{}",
+                "quote_source_counts": "{}",
+                "fallback_count": 0,
+                "modeled_spread_bps": 4.0,
+                "modeled_slippage_bps": 2.0,
+                "risk_profile": engine.config.risk_profile,
+                "capital_deployment_fraction": engine.config.capital_deployment_fraction,
+                "max_buying_power_used": 1000.0,
+                "synthetic_data_used": False,
+                "performance_warning": "",
+            }
+
+        with patch.object(BacktestEngine, "run", fake_run):
+            frame = optimize_for_total_return(
+                config,
+                symbol_baskets=baskets,
+                timeframes=["15Min"],
+                windows=windows,
+                short_modes=[True, False],
+                risk_profiles=["conservative"],
+            )
+
+        self.assertTrue(Path(output_path).exists())
+        required_columns = {
+            "candidate_name",
+            "symbols",
+            "timeframe",
+            "allow_short",
+            "risk_profile",
+            "total_return",
+            "max_drawdown",
+            "win_rate",
+            "average_r",
+            "trade_count",
+            "rejected_trade_count",
+            "realized_reward_to_risk",
+            "synthetic_data_used",
+        }
+        self.assertTrue(required_columns.issubset(frame.columns))
+        self.assertFalse(bool(frame.iloc[0]["allow_short"]))
+        self.assertTrue(bool(frame.iloc[0]["validation_pass"]))
+        self.assertTrue(bool(frame.iloc[0]["recommended_default"]))
 
 
 class EntryRiskCheckTests(unittest.TestCase):

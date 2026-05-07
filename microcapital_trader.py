@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -61,6 +61,10 @@ TRUTHY_VALUES = {"1", "true", "yes", "y", "on"}
 FALSY_VALUES = {"0", "false", "no", "n", "off"}
 
 RISK_PROFILES = {"conservative", "aggressive_margin"}
+
+OPTIMIZATION_TIMEFRAMES = ["15Min", "30Min", "1Hour", "5Min"]
+OPTIMIZATION_MIN_TRADE_COUNT = 15
+OPTIMIZATION_MAX_DRAWDOWN = -6.0
 
 ACTIVE_ORDER_STATUSES = {
     "new",
@@ -197,11 +201,13 @@ class Config:
     partial_take_profit_r: float = 1.0
     final_take_profit_r: float = 2.0
     compare_output_path: str = "strategy_comparison.csv"
+    optimization_output_path: str = "optimization_results.csv"
     journal_path: str = "trade_journal.csv"
     state_path: str = "live_state.json"
     run_id: str = field(default_factory=new_run_id)
     data_dir: str = "data"
     strict_data: bool = False
+    historical_end: str = ""
     session_start_hour_utc: int = 13
     session_end_hour_utc: int = 20
     paper_feed: str = "iex"
@@ -268,6 +274,12 @@ class Config:
             config.spread_bps = float(os.getenv("SPREAD_BPS", config.spread_bps))
         if os.getenv("TIMEFRAME"):
             config.timeframe = os.getenv("TIMEFRAME", config.timeframe)
+        if os.getenv("LOOKBACK_DAYS"):
+            config.lookback_days = int(os.getenv("LOOKBACK_DAYS", config.lookback_days))
+        if os.getenv("HISTORICAL_END"):
+            config.historical_end = os.getenv("HISTORICAL_END", config.historical_end)
+        if os.getenv("OPTIMIZATION_OUTPUT_PATH"):
+            config.optimization_output_path = os.getenv("OPTIMIZATION_OUTPUT_PATH", config.optimization_output_path)
         if os.getenv("JOURNAL_PATH"):
             config.journal_path = os.getenv("JOURNAL_PATH", config.journal_path)
         if os.getenv("STATE_PATH"):
@@ -837,7 +849,7 @@ class DataLoader:
     def _fetch_historical_data(self, symbol: str) -> pd.DataFrame | None:
         if not (self.config.alpaca_api_key and self.config.alpaca_secret_key):
             return None
-        end = datetime.now(UTC)
+        end = self._historical_end()
         start = end - timedelta(days=self.config.lookback_days)
         if ALPACA_AVAILABLE:
             timeframe = timeframe_to_alpaca(self.config.timeframe)
@@ -898,6 +910,11 @@ class DataLoader:
                 }
             )
         return pd.DataFrame(rows)
+
+    def _historical_end(self) -> datetime:
+        if self.config.historical_end:
+            return utc_timestamp(self.config.historical_end).to_pydatetime()
+        return datetime.now(UTC)
 
     def _generate_sample_data(self, symbol: str) -> pd.DataFrame:
         periods = max(self.config.lookback_days * 26, 250)
@@ -986,7 +1003,20 @@ class VWAPMomentumBreakoutStrategy(Strategy):
         estimated_spread_bps: float,
     ) -> Signal | None:
         row = history.iloc[-1]
-        if any(pd.isna(row[key]) for key in ["vwap", "recent_high", "recent_low", "rvol"]):
+        required_signal_fields = [
+            "close",
+            "high",
+            "low",
+            "ema_fast",
+            "ema_slow",
+            "vwap",
+            "recent_high",
+            "recent_low",
+            "rvol",
+            "strong_close",
+            "weak_close",
+        ]
+        if any(pd.isna(row[key]) for key in required_signal_fields):
             return None
         bar_time = row["timestamp"]
         if not within_session(bar_time, config):
@@ -1340,13 +1370,20 @@ class SimulatedBrokerAdapter(BrokerAdapter):
 
 
 class BacktestEngine:
-    def __init__(self, config: Config, journal: Journal):
+    def __init__(
+        self,
+        config: Config,
+        journal: Any,
+        data_loader_factory: Callable[[Config], Any] = DataLoader,
+    ):
         self.config = config
         self.journal = journal
+        self.data_loader_factory = data_loader_factory
 
     def run(self) -> dict[str, Any]:
         strategy = STRATEGIES[self.config.strategy]
         broker = SimulatedBrokerAdapter(self.config)
+        loader = self.data_loader_factory(self.config)
         equity = self.config.starting_capital
         positions: dict[str, BacktestPosition] = {}
         trade_pnls: list[float] = []
@@ -1368,7 +1405,7 @@ class BacktestEngine:
         max_buying_power_used = 0.0
 
         for symbol in self.config.symbols:
-            data = DataLoader(self.config).load_historical_data(symbol)
+            data = loader.load_historical_data(symbol)
             data_sources[symbol] = str(data.attrs.get("data_source", "unknown"))
             if data_sources[symbol] == "synthetic_sample":
                 fallback_count += 1
@@ -1634,6 +1671,282 @@ class BacktestEngine:
                 ),
             }
         )
+
+
+@dataclass(frozen=True)
+class OptimizationWindow:
+    name: str
+    lookback_days: int
+    historical_end: str
+
+
+@dataclass(frozen=True)
+class SymbolBasket:
+    name: str
+    symbols: tuple[str, ...]
+
+
+class NullJournal:
+    def log(self, row: dict[str, Any]) -> None:
+        return
+
+
+class HistoricalDataCache:
+    def __init__(self):
+        self.frames: dict[tuple[Any, ...], pd.DataFrame] = {}
+
+    def loader_for(self, config: Config) -> "CachedHistoricalDataLoader":
+        return CachedHistoricalDataLoader(config, self)
+
+    def load(self, config: Config, symbol: str) -> pd.DataFrame:
+        key = (
+            config.asset_class,
+            symbol,
+            config.timeframe,
+            config.lookback_days,
+            config.historical_end,
+            config.data_dir,
+            config.strict_data,
+            config.ema_fast,
+            config.ema_slow,
+            config.vwap_window,
+            config.rvol_window,
+            config.breakout_lookback,
+        )
+        if key not in self.frames:
+            self.frames[key] = DataLoader(config).load_historical_data(symbol)
+        return self.frames[key]
+
+
+class CachedHistoricalDataLoader:
+    def __init__(self, config: Config, cache: HistoricalDataCache):
+        self.config = config
+        self.cache = cache
+
+    def load_historical_data(self, symbol: str) -> pd.DataFrame:
+        return self.cache.load(self.config, symbol)
+
+
+def unique_symbols(symbols: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for symbol in symbols:
+        normalized = canonical_symbol(symbol)
+        if normalized and normalized not in seen:
+            ordered.append(normalized)
+            seen.add(normalized)
+    return tuple(ordered)
+
+
+def default_symbol_baskets(base_symbols: list[str]) -> list[SymbolBasket]:
+    base = unique_symbols(base_symbols)
+    baskets = [
+        SymbolBasket("baseline_default", base),
+        SymbolBasket("default_minus_current_losers", tuple(symbol for symbol in base if symbol not in {"NET", "PLTR", "QCOM"})),
+        SymbolBasket("default_minus_long_only_drags", tuple(symbol for symbol in base if symbol not in {"PLTR", "NFLX"})),
+        SymbolBasket(
+            "top_contributors_10",
+            tuple(symbol for symbol in ["INTC", "ARM", "NOW", "TQQQ", "ORCL", "AMZN", "BABA", "NFLX", "CRWD", "PYPL"] if symbol in base),
+        ),
+        SymbolBasket(
+            "top_contributors_7",
+            tuple(symbol for symbol in ["INTC", "ARM", "NOW", "TQQQ", "ORCL", "AMZN", "BABA"] if symbol in base),
+        ),
+        SymbolBasket("old_aapl_amd_msft_control", ("AAPL", "AMD", "MSFT")),
+    ]
+    filtered: list[SymbolBasket] = []
+    seen: set[tuple[str, ...]] = set()
+    for basket in baskets:
+        symbols = unique_symbols(basket.symbols)
+        if not symbols or symbols in seen:
+            continue
+        filtered.append(SymbolBasket(basket.name, symbols))
+        seen.add(symbols)
+    return filtered
+
+
+def default_optimization_windows(anchor: datetime | None = None) -> list[OptimizationWindow]:
+    run_anchor = (anchor or datetime.now(UTC)).replace(microsecond=0)
+    return [
+        OptimizationWindow("current_30d", 30, run_anchor.isoformat()),
+        OptimizationWindow("prior_30d", 30, (run_anchor - timedelta(days=30)).isoformat()),
+        OptimizationWindow("combined_60d", 60, run_anchor.isoformat()),
+    ]
+
+
+def apply_optimizer_risk_profile(config: Config, risk_profile: str) -> None:
+    config.risk_profile = risk_profile
+    if risk_profile == "aggressive_margin":
+        config.apply_risk_profile_defaults()
+        return
+    defaults = Config()
+    config.risk_per_trade = defaults.risk_per_trade
+    config.capital_deployment_fraction = defaults.capital_deployment_fraction
+    config.max_daily_loss = defaults.max_daily_loss
+
+
+def optimization_candidate_config(
+    base_config: Config,
+    basket: SymbolBasket,
+    timeframe: str,
+    allow_short: bool,
+    risk_profile: str,
+    window: OptimizationWindow,
+) -> Config:
+    candidate = replace(base_config)
+    candidate.mode = "backtest"
+    candidate.symbols = list(basket.symbols)
+    candidate.timeframe = timeframe
+    candidate.allow_short = allow_short
+    candidate.lookback_days = window.lookback_days
+    candidate.historical_end = window.historical_end
+    candidate.strict_data = True
+    apply_optimizer_risk_profile(candidate, risk_profile)
+    return candidate
+
+
+def guardrail_pass(result: dict[str, Any]) -> bool:
+    return (
+        not bool(result.get("synthetic_data_used", False))
+        and float(result.get("max_drawdown", 0.0)) >= OPTIMIZATION_MAX_DRAWDOWN
+        and int(result.get("trade_count", 0)) >= OPTIMIZATION_MIN_TRADE_COUNT
+    )
+
+
+def optimize_for_total_return(
+    config: Config,
+    symbol_baskets: list[SymbolBasket] | None = None,
+    timeframes: list[str] | None = None,
+    windows: list[OptimizationWindow] | None = None,
+    short_modes: list[bool] | None = None,
+    risk_profiles: list[str] | None = None,
+) -> pd.DataFrame:
+    baskets = symbol_baskets or default_symbol_baskets(config.symbols)
+    candidate_timeframes = timeframes or OPTIMIZATION_TIMEFRAMES
+    candidate_windows = windows or default_optimization_windows()
+    candidate_short_modes = short_modes if short_modes is not None else [True, False]
+    candidate_risk_profiles = risk_profiles or ["conservative", "aggressive_margin"]
+    data_cache = HistoricalDataCache()
+    rows: list[dict[str, Any]] = []
+
+    for window in candidate_windows:
+        for basket in baskets:
+            for timeframe in candidate_timeframes:
+                for allow_short in candidate_short_modes:
+                    for risk_profile in candidate_risk_profiles:
+                        candidate = optimization_candidate_config(
+                            config,
+                            basket,
+                            timeframe,
+                            allow_short,
+                            risk_profile,
+                            window,
+                        )
+                        result = BacktestEngine(
+                            candidate,
+                            NullJournal(),
+                            data_loader_factory=data_cache.loader_for,
+                        ).run()
+                        passed = guardrail_pass(result)
+                        rows.append(
+                            {
+                                "candidate_name": basket.name,
+                                "symbols": " ".join(candidate.symbols),
+                                "timeframe": timeframe,
+                                "allow_short": allow_short,
+                                "risk_profile": risk_profile,
+                                "window_name": window.name,
+                                "lookback_days": window.lookback_days,
+                                "historical_end": window.historical_end,
+                                "total_return": result["total_return"],
+                                "max_drawdown": result["max_drawdown"],
+                                "win_rate": result["win_rate"],
+                                "average_r": result["average_r"],
+                                "trade_count": result["trade_count"],
+                                "rejected_trade_count": result["rejected_trade_count"],
+                                "realized_reward_to_risk": result["realized_reward_to_risk"],
+                                "synthetic_data_used": result["synthetic_data_used"],
+                                "guardrail_pass": passed,
+                                "high_risk": risk_profile == "aggressive_margin",
+                                "ending_equity": result["ending_equity"],
+                                "fallback_count": result["fallback_count"],
+                                "max_buying_power_used": result["max_buying_power_used"],
+                            }
+                        )
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        frame.to_csv(config.optimization_output_path, index=False)
+        return frame
+
+    baseline_mask = (
+        (frame["candidate_name"] == "baseline_default")
+        & (frame["timeframe"] == "15Min")
+        & frame["allow_short"]
+        & (frame["risk_profile"] == "conservative")
+    )
+    baseline_by_window = dict(zip(frame.loc[baseline_mask, "window_name"], frame.loc[baseline_mask, "total_return"]))
+    frame["beats_baseline"] = frame.apply(
+        lambda row: float(row["total_return"]) > float(baseline_by_window.get(row["window_name"], row["total_return"])),
+        axis=1,
+    )
+    group_columns = ["candidate_name", "symbols", "timeframe", "allow_short", "risk_profile"]
+    outperforming_counts = (
+        frame[frame["guardrail_pass"] & frame["beats_baseline"]]
+        .groupby(group_columns)["window_name"]
+        .nunique()
+        .to_dict()
+    )
+    frame["outperforming_windows"] = [
+        int(outperforming_counts.get(tuple(row[column] for column in group_columns), 0))
+        for _, row in frame.iterrows()
+    ]
+    frame["validation_pass"] = frame["outperforming_windows"] >= 2
+    frame["recommended_default"] = frame["validation_pass"] & frame["guardrail_pass"] & ~frame["high_risk"]
+    frame = frame.sort_values(
+        [
+            "recommended_default",
+            "validation_pass",
+            "guardrail_pass",
+            "high_risk",
+            "total_return",
+            "win_rate",
+            "average_r",
+        ],
+        ascending=[False, False, False, True, False, False, False],
+    ).reset_index(drop=True)
+    frame.to_csv(config.optimization_output_path, index=False)
+    return frame
+
+
+def print_optimization_results(frame: pd.DataFrame, output_path: str) -> None:
+    if frame.empty:
+        print("No optimization results available.")
+        print(f"Wrote optimization results: {output_path}")
+        return
+    print(f"Wrote optimization results: {output_path}")
+    print(
+        frame[
+            [
+                "candidate_name",
+                "window_name",
+                "timeframe",
+                "allow_short",
+                "risk_profile",
+                "total_return",
+                "max_drawdown",
+                "win_rate",
+                "trade_count",
+                "rejected_trade_count",
+                "guardrail_pass",
+                "validation_pass",
+                "recommended_default",
+                "high_risk",
+            ]
+        ]
+        .head(20)
+        .to_string(index=False)
+    )
 
 
 def compare_strategies(config: Config) -> pd.DataFrame:
@@ -3257,6 +3570,10 @@ class TradingBot:
             frame = compare_strategies(self.config)
             print_strategy_comparison(frame)
             return
+        if self.config.mode == "optimize":
+            frame = optimize_for_total_return(self.config)
+            print_optimization_results(frame, self.config.optimization_output_path)
+            return
         if execution_mode(self.config.mode) == "backtest":
             journal = Journal(self.config.journal_path, self.config.run_id)
             result = BacktestEngine(self.config, journal).run()
@@ -3271,17 +3588,20 @@ class TradingBot:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Lightweight trading bot for small accounts.")
-    parser.add_argument("--mode", choices=["backtest", "paper", "live", "scheduled_paper", "scheduled_live"], default="backtest")
+    parser.add_argument("--mode", choices=["backtest", "optimize", "paper", "live", "scheduled_paper", "scheduled_live"], default="backtest")
     parser.add_argument("--asset-class", choices=["equity", "crypto"], default=None)
     parser.add_argument("--compare", action="store_true", help="Run a momentum backtest summary and write strategy_comparison.csv.")
     parser.add_argument("--symbols", nargs="+", help="Override watchlist symbols.")
     parser.add_argument("--capital", type=float, help="Override starting capital.")
     parser.add_argument("--timeframe", default=None, help="Override timeframe such as 5Min or 15Min.")
+    parser.add_argument("--lookback-days", type=int, default=None, help="Override historical lookback days.")
+    parser.add_argument("--historical-end", default=None, help="Override historical end timestamp for backtests.")
     parser.add_argument("--risk-profile", choices=sorted(RISK_PROFILES), default=None)
     parser.add_argument("--capital-deployment-fraction", type=float, default=None)
     parser.add_argument("--max-daily-loss", type=float, default=None)
     parser.add_argument("--journal-path", default=None)
     parser.add_argument("--state-path", default=None)
+    parser.add_argument("--optimization-output-path", default=None)
     parser.add_argument("--strict-data", action="store_true", help="Refuse synthetic sample data in backtests.")
     parser.add_argument("--show-plan", action="store_true", help="Print the short implementation plan before running.")
     return parser.parse_args()
@@ -3302,6 +3622,10 @@ def main() -> None:
         config.starting_capital = args.capital
     if args.timeframe:
         config.timeframe = args.timeframe
+    if args.lookback_days is not None:
+        config.lookback_days = args.lookback_days
+    if args.historical_end:
+        config.historical_end = args.historical_end
     if args.capital_deployment_fraction is not None:
         config.capital_deployment_fraction = args.capital_deployment_fraction
     if args.max_daily_loss is not None:
@@ -3310,6 +3634,8 @@ def main() -> None:
         config.journal_path = args.journal_path
     if args.state_path:
         config.state_path = args.state_path
+    if args.optimization_output_path:
+        config.optimization_output_path = args.optimization_output_path
     if args.strict_data:
         config.strict_data = True
     TradingBot(config).run(compare=args.compare, show_plan=args.show_plan)
